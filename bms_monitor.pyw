@@ -71,7 +71,8 @@ class BmsWorker:
         self.paused = False
         self.wake = asyncio.Event()
         threading.Thread(target=self.loop.run_forever, daemon=True).start()
-        asyncio.run_coroutine_threadsafe(self._run(), self.loop)
+        asyncio.run_coroutine_threadsafe(self._run(), self.loop).add_done_callback(
+            lambda f: self.post("status", f"Worker stopped: {f.exception()!r}; restart the monitor"))
 
     async def _disconnect(self):
         if self.bms:
@@ -110,7 +111,7 @@ class BmsWorker:
                     await self._poll_once(cfg)
                 except Exception as e:
                     await self._disconnect()
-                    self.post("status", f"Error: {e}; next try in {POLL_SECONDS // 60} min or on Refresh")
+                    self.post("status", f"Error: {str(e) or type(e).__name__}; next try in {POLL_SECONDS // 60} min or on Refresh")
             try:
                 await asyncio.wait_for(self.wake.wait(), timeout=None if self.paused else POLL_SECONDS)
             except asyncio.TimeoutError:
@@ -126,8 +127,18 @@ class BmsWorker:
             self.wake.set()
         self.loop.call_soon_threadsafe(apply)
 
+    def close(self):
+        """Release the BLE connection before exit; paused keeps the loop from reconnecting."""
+        async def job():
+            self.paused = True
+            await self._disconnect()
+        return asyncio.run_coroutine_threadsafe(job(), self.loop)
+
     def set_mos(self, charge: bool, discharge: bool):
         async def job():
+            if not (self.bms and self.bms.is_connected):
+                self.post("error", "Switch command not sent: the BMS is not connected")
+                return
             try:
                 await self.bms.set_mos(charge, discharge)
                 self.post("status", f"Sent: charging {'enabled' if charge else 'disabled'}, "
@@ -166,6 +177,7 @@ class App:
         self.alerted = set()
         self.tray_soc = None
         self.worker = None
+        self.closing = False
 
         self.root = tk.Tk()
         self.root.title("BMS Monitor")
@@ -255,12 +267,14 @@ class App:
         paused = self.connect_btn.cget("text") == "Disconnect"
         self.connect_btn.config(text="Connect" if paused else "Disconnect")
         self.refresh_btn.config(state="disabled" if paused else "normal")
+        self._update_buttons()
         if self.worker:
             self.worker.set_paused(paused)
 
     def _update_buttons(self):
         b = self.last_basic
-        state = "normal" if self.dev_mode.get() and b else "disabled"
+        connected = self.connect_btn.cget("text") == "Disconnect"
+        state = "normal" if self.dev_mode.get() and b and connected else "disabled"
         for btn, name, on in ((self.chg_btn, "charging", b and b.charge_on), (self.dsg_btn, "output", b and b.discharge_on)):
             btn.config(state=state, text=f"{'Disable' if on else 'Enable'} {name}" if b else name.capitalize())
 
@@ -347,7 +361,7 @@ class App:
             self.tray.notify(text, "Battery alert")
 
     def _pump(self):
-        while not self.events.empty():
+        while not self.closing and not self.events.empty():
             kind, payload = self.events.get()
             if kind == "data":
                 self._show_data(*payload)
@@ -360,9 +374,18 @@ class App:
                 self.root.deiconify()
                 self.root.lift()
             elif kind == "exit":
+                self.closing = True
+                self.root.withdraw()
                 self.tray.stop()
-                self.root.destroy()
+                self._finish_exit(self.worker.close() if self.worker else None, time.monotonic() + 5)
                 return
+
+    def _finish_exit(self, fut, deadline):
+        # Tk keeps running while the worker disconnects, so a worker post cannot block the disconnect.
+        if fut and not fut.done() and time.monotonic() < deadline:
+            self.root.after(100, self._finish_exit, fut, deadline)
+        else:
+            self.root.destroy()
 
 
 if __name__ == "__main__":
