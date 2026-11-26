@@ -1,8 +1,10 @@
 ; Inno Setup script: per-user installer for the PyInstaller build in dist\JK Monitor\, with an optional autostart task.
-; Build with build_installer.bat; the result is Output\JKMonitor-Setup.exe.
+; Build with build_installer.bat, which passes /DAppVersion from version.py; the result is Output\JKMonitor-Setup-<version>.exe.
 
+#ifndef AppVersion
+  #error Pass the version: ISCC /DAppVersion=x.y.z jk_monitor.iss (build_installer.bat does it)
+#endif
 #define AppName "JK Monitor"
-#define AppVersion "1.0"
 #define AppExe "JK Monitor.exe"
 
 [Setup]
@@ -15,7 +17,8 @@ DefaultGroupName={#AppName}
 PrivilegesRequired=lowest
 DisableProgramGroupPage=yes
 OutputDir=Output
-OutputBaseFilename=JKMonitor-Setup
+OutputBaseFilename=JKMonitor-Setup-{#AppVersion}
+VersionInfoVersion={#AppVersion}
 UninstallDisplayIcon={app}\{#AppExe}
 Compression=lzma2
 SolidCompression=yes
