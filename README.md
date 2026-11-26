@@ -13,9 +13,11 @@ Both apps:
 - show all BMS alarms or protections in the window;
 - keep a session history of alarms, threshold warnings and lost links (the "History" button);
 - show a tray notification when the link stays lost for 5 minutes;
-- start hidden in the tray with `--tray`; the installers use it for autostart.
+- start hidden in the tray with `--tray`; the installers use it for autostart;
+- have a "Scan" dialog to choose a BMS nearby; JBD Monitor lists only devices that answer a JBD read,
+  because other devices advertise the same Bluetooth service.
 
-JK Monitor also has a "Details" tab and a "Scan" dialog to choose a BMS nearby.
+JK Monitor also has a "Details" tab.
 
 ## Install
 

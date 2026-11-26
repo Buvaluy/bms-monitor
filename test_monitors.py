@@ -96,9 +96,10 @@ def fake_app(module, root=None):
     app.vars, app.detail_vars = collections.defaultdict(Var), collections.defaultdict(Var)
     app.updated_var, app.status_var = Var("Updated: --"), Var("Starting...")
     app.history_btn, app.connect_btn, app.refresh_btn = Widget("History"), Widget("Disconnect"), Widget("Refresh")
+    app.scan_busy, app.scan_btn = False, Widget("Scan")
     rows = ["Voltage", "Current", "Power", "Capacity", "Cycles", "Temperature", "Cells", "Cell delta", "Switches"]
     if module is jkm:
-        app.scan_busy, app.uptime_text, app.scan_btn = False, "--", Widget("Scan")
+        app.uptime_text = "--"
         app.alarm_labels = {n: Widget() for n in jk_bms.ALARM_BITS}
         rows += ["MOS temp", "Balancing", "Alarms"]
     else:
@@ -338,23 +339,19 @@ class MonitorTest(unittest.TestCase):
                 app.events.put(data_event(module, (3.3,) * 4))
                 app._pump()
                 self.assertIsNone(app.no_link_since)
-                user_stops = ["Disconnected; the battery is free for the phone"]
-                if module is jkm:
-                    user_stops.append("Scanning for JK BMS (10 s)...")
-                    app.scan_busy = True
-                for stop in user_stops:
+                app.scan_busy = True
+                for stop in ("Disconnected; the battery is free for the phone", module.BmsWorker.scan_status):
                     for status in (ERROR, stop):
                         app.events.put(("status", status))
                     app._pump()
                     app.root.run_jobs()
                 self.assertEqual(len(app.tray.notes), 1)
-                if module is jkm:
-                    app.scan_busy = False
-                    for status in (ERROR, "Scanning for JK BMS..."):
-                        app.events.put(("status", status))
-                    app._pump()
-                    app.root.run_jobs()
-                    self.assertEqual(len(app.tray.notes), 2)
+                app.scan_busy = False
+                for status in (ERROR, "Scanning for JK BMS..." if module is jkm else "Scanning for BMS..."):
+                    app.events.put(("status", status))
+                app._pump()
+                app.root.run_jobs()
+                self.assertEqual(len(app.tray.notes), 2)
                 app.events.put(("status", ERROR))
                 app._pump()
                 app.root.run_jobs()
@@ -483,28 +480,35 @@ class MonitorTest(unittest.TestCase):
         root = tk.Tk()
         self.addCleanup(root.destroy)
         root.withdraw()
-        calls = []
-        app = fake_app(jkm, root)
-        app.worker = types.SimpleNamespace(scan=lambda: calls.append("scan"),
-                                           choose=lambda address: calls.append(f"choose {address}"))
-        found = [("AA", "JK-A", -60), ("BB", "JK-B", -70)]
-        app._show_scan(found, "AA")
-        root.update()
-        self.assertTrue(dialog(root).winfo_viewable())
-        button(dialog(root), "Rescan").invoke()
-        self.assertEqual(calls, ["scan"])
+        for module in (jkm, jbm):
+            with self.subTest(module.__name__):
+                calls = []
+                app = fake_app(module, root)
+                app.worker = types.SimpleNamespace(scan=lambda: calls.append("scan"),
+                                                   choose=lambda address: calls.append(f"choose {address}"))
+                found = [("AA", "BMS-A", -60), ("BB", "BMS-B", -70)]
+                app._show_scan(found, "AA")
+                root.update()
+                self.assertTrue(dialog(root).winfo_viewable())
+                button(dialog(root), "Rescan").invoke()
+                self.assertEqual(calls, ["scan"])
 
-        app.alerted = {"Cells"}
-        app.vars["Device"].set("JK-A device")
-        app.detail_vars["Cell OVP"].set("3.650 V")
-        app._show_scan(found, "AA")
-        listbox = next(w for w in dialog(root).winfo_children() if isinstance(w, tk.Listbox))
-        listbox.selection_clear(0, "end")
-        listbox.selection_set(1)
-        button(dialog(root), "Connect").invoke()
-        self.assertEqual(calls[-1], "choose BB")
-        self.assertEqual((app.alerted, app.vars["Device"].get(), app.detail_vars["Cell OVP"].get()), (set(), "--", "--"))
-        self.assertEqual(app.history.entries[-1].name, "BMS changed")
+                app.alerted = {"Cells"}
+                app.vars["Device"].set("JK-A device")
+                app.detail_vars["Cell OVP"].set("3.650 V")
+                app.last_basic = object()
+                app._show_scan(found, "AA")
+                listbox = next(w for w in dialog(root).winfo_children() if isinstance(w, tk.Listbox))
+                listbox.selection_clear(0, "end")
+                listbox.selection_set(1)
+                button(dialog(root), "Connect").invoke()
+                self.assertEqual(calls[-1], "choose BB")
+                self.assertEqual(app.alerted, set())
+                self.assertEqual(app.history.entries[-1].name, "BMS changed")
+                if module is jkm:
+                    self.assertEqual((app.vars["Device"].get(), app.detail_vars["Cell OVP"].get()), ("--", "--"))
+                else:
+                    self.assertIsNone(app.last_basic)
 
     def test_only_one_instance_runs(self):
         name = f"Local\\bms_monitor_test_{os.getpid()}"

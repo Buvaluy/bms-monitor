@@ -87,6 +87,7 @@ class JbdBmsTest(unittest.TestCase):
         with mock.patch.object(jbd_bms, "BleakScanner", types.SimpleNamespace(discover=discover)), \
                 mock.patch.object(jbd_bms, "JbdBms", Probe):
             self.assertEqual(asyncio.run(jbd_bms.find_bms()), ("22:22", "xiaoxiang"))
+            self.assertEqual(asyncio.run(jbd_bms.find_all_bms()), [("22:22", "xiaoxiang", -60), ("33:33", "far JBD", -75)])
 
 
 if __name__ == "__main__":

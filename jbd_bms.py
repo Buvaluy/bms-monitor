@@ -136,24 +136,37 @@ class JbdBms:
         await self._transact(write_frame(REG_MOS, bytes([0x00, mask])), before_write)
 
 
-async def find_bms(timeout: float = 10.0):
+async def _advertisers(timeout: float) -> list:
     found = await BleakScanner.discover(timeout=timeout, return_adv=True)
-    candidates = sorted(((adv.rssi, dev.address, adv.local_name or dev.name) for dev, adv in found.values()
-                         if SERVICE_UUID in [u.lower() for u in adv.service_uuids]), reverse=True)
+    return sorted(((dev.address, adv.local_name or dev.name or "?", adv.rssi) for dev, adv in found.values()
+                   if SERVICE_UUID in [u.lower() for u in adv.service_uuids]), key=lambda x: -x[2])
+
+
+async def _answers(address: str) -> bool:
     # Other devices advertise FF00 too, so a candidate counts only once it answers a basic-info read.
-    for _rssi, address, name in candidates:
-        bms = JbdBms(address)
+    bms = JbdBms(address)
+    try:
+        await bms.connect()
+        await bms.read_basic()
+        return True
+    except Exception:
+        return False
+    finally:
         try:
-            await bms.connect()
-            await bms.read_basic()
-            return address, name
+            await bms.disconnect()
         except Exception:
             pass
-        finally:
-            try:
-                await bms.disconnect()
-            except Exception:
-                pass
+
+
+async def find_all_bms(timeout: float = 10.0) -> list:
+    """Return [(address, name, rssi)] of JBD BMS units that answer a basic-info read, strongest signal first."""
+    return [c for c in await _advertisers(timeout) if await _answers(c[0])]
+
+
+async def find_bms(timeout: float = 10.0):
+    for address, name, _rssi in await _advertisers(timeout):
+        if await _answers(address):
+            return address, name
     return None, None
 
 
