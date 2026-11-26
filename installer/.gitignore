@@ -1,0 +1,4 @@
+# Build outputs of build_installer.bat.
+build/
+dist/
+Output/
