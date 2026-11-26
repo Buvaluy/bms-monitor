@@ -27,8 +27,8 @@ DEFAULT_MOS_TEMP = (None, None, 65, 75)
 # (red below, yellow below, yellow above, red above); None = no limit. LiFePO4 4S, 334 Ah, 200 A BMS.
 THRESHOLDS = {
     "soc": (20, 50, None, None),
-    "pack_v": (11.2, 12.0, 13.8, 14.6),
-    "cell_v": (2.8, 3.0, 3.45, 3.6),
+    "pack_v": (10.0, 12.0, 13.8, 14.6),
+    "cell_v": (2.5, 3.0, 3.45, 3.65),
     "cell_delta_mv": (None, None, 30, 100),
     "temp_c": (0, 10, 35, 45),
     "mos_temp_c": DEFAULT_MOS_TEMP,
