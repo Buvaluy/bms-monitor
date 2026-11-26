@@ -181,7 +181,8 @@ class JkBms:
         self._buf += data
         while (start := self._buf.find(FRAME_HEADER)) >= 0 and len(self._buf) - start >= FRAME_LEN:
             frame = bytes(self._buf[start:start + FRAME_LEN])
-            if sum(frame[:-1]) & 0xFF != frame[-1]:
+            # A header inside the window means the frame at start was cut short (the checksum passes 1 in 256).
+            if FRAME_HEADER in frame[1:] or sum(frame[:-1]) & 0xFF != frame[-1]:
                 del self._buf[:start + 1]
                 continue
             del self._buf[:start + FRAME_LEN]

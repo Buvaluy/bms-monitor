@@ -1,24 +1,22 @@
-#!python3.10
+#!python3.13
 # Tkinter + tray monitor for a JBD BMS over BLE; MOSFET control buttons are unlocked by the "Dev mode" switch.
 # Pass --tray to start with the window hidden in the tray (used by the Windows autostart entry).
 import asyncio
-import json
-import queue
-import sys
-import threading
 import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import messagebox, ttk
 
-import pystray
 from PIL import Image, ImageDraw, ImageFont
 
-from alarm_history import ALARM, LINK, THRESHOLD, AlarmHistory, HistoryWindow
+from alarm_history import ALARM, LINK, THRESHOLD
 from jbd_bms import JbdBms, find_bms
+from monitor_common import MonitorApp, MonitorWorker, read_config, run_app, write_config
 
 CONFIG_PATH = Path(__file__).with_name("bms_config.json")
-POLL_SECONDS = 120
+# The link stays open between polls, so a short interval costs two small reads, not a reconnect.
+POLL_SECONDS = 15
+RETRY_SECONDS = 120
 
 PROTECTION_BITS = [
     "cell overvoltage", "cell undervoltage", "pack overvoltage", "pack undervoltage",
@@ -65,7 +63,7 @@ def value_levels(basic, cells, prot) -> dict:
         "Capacity": level("soc", basic.soc),
         "Temperature": max((level("temp_c", t) for t in basic.temps_c), default=GREEN),
         "Cells": max((level("cell_v", c) for c in cells), default=GREEN),
-        "Cell delta": level("cell_delta_mv", (max(cells) - min(cells)) * 1000) if cells else GREEN,
+        "Cell delta": level("cell_delta_mv", round((max(cells) - min(cells)) * 1000)) if cells else GREEN,
         "Switches": GREEN if basic.charge_on and basic.discharge_on else YELLOW,
         "Protection": RED if prot else GREEN,
     }
@@ -88,43 +86,28 @@ def poll_conditions(basic, cells, prot) -> dict:
 
 
 def load_config() -> dict:
-    try:
-        return json.loads(CONFIG_PATH.read_text())
-    except (OSError, ValueError):
-        return {}
+    return read_config(CONFIG_PATH)
 
 
 def save_config(cfg: dict):
-    CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+    write_config(CONFIG_PATH, cfg)
 
 
-class BmsWorker:
-    """Owns the asyncio loop and the BLE connection; reports to the UI through post(kind, payload)."""
+class UserDisconnected(Exception):
+    pass
 
+
+class BmsWorker(MonitorWorker):
     def __init__(self, post):
-        self.post = post
-        self.loop = asyncio.new_event_loop()
-        self.bms = None
-        self.paused = False
-        self.wake = asyncio.Event()
-        self.task = None
-        threading.Thread(target=self.loop.run_forever, daemon=True).start()
-        asyncio.run_coroutine_threadsafe(self._run(), self.loop).add_done_callback(self._on_stopped)
-
-    def _on_stopped(self, f):
-        if not f.cancelled() and f.exception() is not None:
-            self.post("status", f"Worker stopped: {f.exception()!r}; restart the monitor")
-
-    async def _disconnect(self):
-        if self.bms:
-            try:
-                await self.bms.disconnect()
-            except Exception:
-                pass
-            self.bms = None
+        # Register E1 sets both MOSFETs at once; this is its "disable" mask as this monitor last sent it.
+        self.mos_off = 0
+        self.switching = asyncio.Lock()  # one switch command at a time: each builds its mask from the last one's mos_off
+        super().__init__(post, POLL_SECONDS, RETRY_SECONDS, load_config, save_config, CONFIG_PATH.name)
 
     async def _poll_once(self, cfg: dict):
         if not (self.bms and self.bms.is_connected):
+            if self.bms:
+                self.post("status", "Error: link lost; reconnecting")
             await self._disconnect()
             if not cfg.get("address"):
                 self.post("status", "Scanning for BMS...")
@@ -132,7 +115,7 @@ class BmsWorker:
                 if not address:
                     raise IOError("BMS not found")
                 cfg["address"] = address
-                save_config(cfg)
+                self._save(cfg)
             self.post("status", f"Connecting to {cfg['address']}...")
             self.bms = JbdBms(cfg["address"])
             await self.bms.connect()
@@ -141,57 +124,50 @@ class BmsWorker:
         cells = await self.bms.read_cells()
         self.post("data", (basic, cells))
 
-    async def _run(self):
-        self.task = asyncio.current_task()
-        cfg = load_config()
-        while True:
-            if self.paused:
-                await self._disconnect()
-                self.post("status", "Disconnected; the battery is free for the phone")
-            else:
-                try:
-                    await self._poll_once(cfg)
-                except Exception as e:
-                    await self._disconnect()
-                    self.post("status", f"Error: {str(e) or type(e).__name__}; next try in {POLL_SECONDS // 60} min or on Refresh")
-            try:
-                await asyncio.wait_for(self.wake.wait(), timeout=None if self.paused else POLL_SECONDS)
-            except asyncio.TimeoutError:
-                pass
-            self.wake.clear()
-
     def refresh(self):
         self.loop.call_soon_threadsafe(self.wake.set)
 
-    def set_paused(self, paused: bool):
-        def apply():
-            self.paused = paused
-            self.wake.set()
-        self.loop.call_soon_threadsafe(apply)
-
-    def close(self):
-        """Stop the poll loop, including a connect in progress, then release the BLE connection before exit."""
+    def set_switch(self, bit: int, on: bool):
+        """Turn one MOSFET (bit 0x01 charge, 0x02 output) on or off; the other keeps the state in mos_off."""
         async def job():
-            self.paused = True
-            if self.task:
-                self.task.cancel()
-                await asyncio.gather(self.task, return_exceptions=True)
-            await self._disconnect()
-        return asyncio.run_coroutine_threadsafe(job(), self.loop)
-
-    def set_mos(self, charge: bool, discharge: bool):
-        async def job():
-            if not (self.bms and self.bms.is_connected):
-                self.post("error", "Switch command not sent: the BMS is not connected")
-                return
-            try:
-                await self.bms.set_mos(charge, discharge)
-                self.post("status", f"Sent: charging {'enabled' if charge else 'disabled'}, "
-                                    f"output {'enabled' if discharge else 'disabled'}")
+            async with self.switching:
+                bms = self.bms
+                if not (bms and bms.is_connected):
+                    self.post("error", "Switch command not sent: the BMS is not connected")
+                    return
+                try:
+                    basic = await bms.read_basic()
+                except Exception as e:
+                    self._switch_not_sent(e)
+                    return
+                # A MOSFET the BMS reports on is not disabled, whatever was sent before (the phone app writes E1 too).
+                self.mos_off &= ~((0x01 if basic.charge_on else 0) | (0x02 if basic.discharge_on else 0))
+                mask = self.mos_off & ~bit if on else self.mos_off | bit
+                charge, discharge = not mask & 0x01, not mask & 0x02
+                try:
+                    await bms.set_mos(charge, discharge, before_write=self._refuse_if_paused)
+                except UserDisconnected as e:
+                    self._switch_not_sent(e)
+                    return
+                except Exception as e:
+                    self.post("error", f"Switch command not confirmed: {str(e) or type(e).__name__}. "
+                                       "The BMS may have applied it; check the switches after the refresh")
+                else:
+                    self.post("status", f"Sent: charging {'enabled' if charge else 'disabled'}, "
+                                        f"output {'enabled' if discharge else 'disabled'}")
+                self.mos_off = mask
                 self.wake.set()
-            except Exception as e:
-                self.post("error", f"Switch command failed: {str(e) or type(e).__name__}")
         asyncio.run_coroutine_threadsafe(job(), self.loop)
+
+    def _refuse_if_paused(self):
+        if self.paused:
+            raise UserDisconnected
+
+    def _switch_not_sent(self, e: Exception):
+        if self.paused:
+            self.post("status", "Switch command not sent: the BMS was disconnected")
+        else:
+            self.post("error", f"Switch command not sent: {str(e) or type(e).__name__}")
 
 
 def tray_image(soc) -> Image.Image:
@@ -215,40 +191,19 @@ def tray_image(soc) -> Image.Image:
     return img
 
 
-class App:
+class App(MonitorApp):
+    worker_class = BmsWorker
+    window_title = "BMS Monitor"
+    tray_name = "bms"
+    tray_idle_title = "BMS: no data"
+    tray_label = "BMS"
+    alert_title = "Battery alert"
+    history_title = "JBD BMS: session history"
+    tray_image = staticmethod(tray_image)
+
     def __init__(self):
-        self.events = queue.Queue()
         self.last_basic = None
-        self.alerted = set()
-        self.history = AlarmHistory()
-        self.history_win = None
-        self.tray_soc = None
-        self.worker = None
-        self.closing = False
-
-        self.root = tk.Tk()
-        self.root.title("BMS Monitor")
-        self.root.resizable(False, False)
-        self.root.protocol("WM_DELETE_WINDOW", self.root.withdraw)
-        self.root.bind("<<BmsEvent>>", lambda _e: self._pump())
-        self._build_ui()
-
-        self.tray = pystray.Icon("bms", tray_image(None), "BMS: no data", menu=pystray.Menu(
-            pystray.MenuItem("Show", lambda: self.post("show", None), default=True),
-            pystray.MenuItem("Exit", lambda: self.post("exit", None)),
-        ))
-        self.tray.run_detached()
-
-        # Cross-thread event_generate needs a running mainloop, so the worker starts from inside it.
-        self.root.after(0, lambda: setattr(self, "worker", BmsWorker(self.post)))
-
-    def post(self, kind: str, payload):
-        """Thread-safe: queue an event and wake the Tk loop instead of polling the queue on a timer."""
-        self.events.put((kind, payload))
-        try:
-            self.root.event_generate("<<BmsEvent>>", when="tail")
-        except (RuntimeError, tk.TclError):
-            pass
+        super().__init__()
 
     def _build_ui(self):
         pad = {"padx": 8, "pady": 2}
@@ -307,11 +262,6 @@ class App:
                   padding=(8, 0, 8, 8)).pack(fill="x")
         self._update_buttons()
 
-    def _refresh(self):
-        if self.worker:
-            self.status_var.set("Refreshing...")
-            self.worker.refresh()
-
     def _toggle_connection(self):
         paused = self.connect_btn.cget("text") == "Disconnect"
         self.connect_btn.config(text="Connect" if paused else "Disconnect")
@@ -329,22 +279,23 @@ class App:
 
     def _toggle(self, which: str):
         b = self.last_basic
-        charge, discharge = b.charge_on, b.discharge_on
-        if which == "charge":
-            charge = not charge
-        else:
-            discharge = not discharge
-        enable = charge if which == "charge" else discharge
+        enable = not (b.charge_on if which == "charge" else b.discharge_on)
         action = {
             ("charge", True): "Enable charging?",
             ("charge", False): "Disable charging? The battery will stop accepting charge.",
             ("discharge", True): "Enable output?",
             ("discharge", False): "Disable output? Everything powered by the battery will lose power.",
         }[which, enable]
+        other_bit, other_on, other = ((0x02, b.discharge_on, "output") if which == "charge"
+                                      else (0x01, b.charge_on, "charging"))
+        if not other_on and not self.worker.mos_off & other_bit:
+            action += (f"\n\n{other.capitalize()} is off now (a protection, or a lock set by another app). "
+                       f"This command also allows {other} again.")
         if messagebox.askyesno("Confirm", action, parent=self.root):
-            self.worker.set_mos(charge, discharge)
+            self.worker.set_switch(0x01 if which == "charge" else 0x02, enable)
 
     def _show_data(self, basic, cells):
+        self._link_up()
         if self.status_var.get() == "Refreshing...":
             self.status_var.set("Refreshed")
         self.last_basic = basic
@@ -369,9 +320,9 @@ class App:
             on = name in prot
             lbl.config(foreground=LEVEL_COLORS[RED] if on else INACTIVE_COLOR,
                        font=("Segoe UI", 9, "bold" if on else "normal"))
-        self._apply_levels(basic, cells, prot)
         if self.history.observe(poll_conditions(basic, cells, prot), time.time()):
             self._history_changed()
+        self._apply_levels(basic, cells, prot)
         self._update_buttons()
         self.updated_var.set(f"Updated: {time.strftime('%H:%M:%S')}")
         if basic.soc != self.tray_soc:
@@ -389,73 +340,30 @@ class App:
         # Each protection is tracked on its own, so a new one notifies even while the row is already red.
         red_now = {n for n, lvl in levels.items() if lvl == RED and n not in ("Power", "Capacity", "Protection")}
         red_now |= {f"Protection: {p}" for p in prot}
-        new = red_now - self.alerted
+        new, gone = red_now - self.alerted, self.alerted - red_now
         self.alerted = red_now
         if new:
-            text = "; ".join(n if n.startswith("Protection: ") else
-                             f"{n}: {self.soc_var.get() if n == 'SOC' else self.vars[n].get()}" for n in sorted(new))
-            self.status_var.set(f"ALERT: {text}")
-            self.tray.notify(text, "Battery alert")
+            self.status_var.set(f"ALERT: {self._alert_text(red_now)}")
+            text = self._alert_text(new)
+            # A Windows tray balloon holds 255 characters; pystray raises ValueError on longer text.
+            self.tray.notify(text if len(text) < 256 else text[:254] + "…", self.alert_title)
+        elif gone and self.status_var.get().startswith("ALERT:"):
+            self.status_var.set(f"ALERT: {self._alert_text(red_now)}" if red_now
+                                else f"Alert cleared at {time.strftime('%H:%M:%S')}")
 
-    def _pump(self):
-        while not self.closing and not self.events.empty():
-            kind, payload = self.events.get()
-            if kind == "data":
-                self._show_data(*payload)
-            elif kind == "status":
-                self.status_var.set(payload)
-                self._track_status(payload)
-            elif kind == "error":
-                self.status_var.set(payload)
-                if self.history.note(LINK, "Command failed", payload, time.time()):
-                    self._history_changed()
-                messagebox.showerror("BMS", payload, parent=self.root)
-            elif kind == "show":
-                self.root.deiconify()
-                self.root.lift()
-            elif kind == "exit":
-                self.closing = True
-                self.root.withdraw()
-                self.tray.stop()
-                self._finish_exit(self.worker.close() if self.worker else None, time.monotonic() + 5)
-                return
+    def _alert_text(self, names) -> str:
+        return "; ".join(n if n.startswith("Protection: ") else
+                         f"{n}: {self.soc_var.get() if n == 'SOC' else self.vars[n].get()}" for n in sorted(names))
 
-    def _track_status(self, text: str):
-        now = time.time()
-        if text.startswith(("Error:", "Worker stopped")):
-            changed = self.history.link_down(text, now)
-        elif text.startswith("Connected to"):
-            changed = self.history.link_up(now)
-        elif text.startswith("Disconnected;"):
-            changed = self.history.cut(now)
-        else:
-            changed = False
-        if changed:
-            self._history_changed()
-
-    def _history_changed(self):
-        active = self.history.active_count()
-        self.history_btn.config(text=f"History ({len(self.history.entries)}"
-                                     + (f", {active} active)" if active else ")"))
-        if self.history_win and self.history_win.alive():
-            self.history_win.refresh()
-
-    def _show_history(self):
-        if self.history_win and self.history_win.alive():
-            self.history_win.show()
-        else:
-            self.history_win = HistoryWindow(self.root, self.history, "JBD BMS: session history")
-
-    def _finish_exit(self, fut, deadline):
-        # Tk keeps running while the worker disconnects, so a worker post cannot block the disconnect.
-        if fut and not fut.done() and time.monotonic() < deadline:
-            self.root.after(100, self._finish_exit, fut, deadline)
-        else:
-            self.root.destroy()
+    def _handle_event(self, kind: str, payload):
+        if kind == "data":
+            self._show_data(*payload)
+        elif kind == "error":
+            self.status_var.set(payload)
+            if self.history.note(LINK, "Command failed", payload, time.time()):
+                self._history_changed()
+            messagebox.showerror("BMS", payload, parent=self.root)
 
 
 if __name__ == "__main__":
-    app = App()
-    if "--tray" in sys.argv:
-        app.root.withdraw()
-    app.root.mainloop()
+    run_app(App, "Local\\jbd_bms_monitor")

@@ -77,6 +77,7 @@ class JbdBms:
         self._client = None
         self._buf = bytearray()
         self._reply = None
+        self._reply_reg = None
         self._lock = asyncio.Lock()
 
     async def connect(self):
@@ -85,6 +86,8 @@ class JbdBms:
         await self._client.start_notify(NOTIFY_UUID, self._on_notify)
 
     async def disconnect(self):
+        if self._reply and not self._reply.done():
+            self._reply.set_exception(ConnectionError("disconnected"))
         if self._client:
             await self._client.disconnect()
 
@@ -97,14 +100,22 @@ class JbdBms:
             self._buf = bytearray()
         self._buf += data
         # Frame: DD reg status len data[len] crc[2] 77; replies arrive split into 20-byte chunks.
-        if len(self._buf) >= 4 and len(self._buf) >= self._buf[3] + 7 and self._reply and not self._reply.done():
+        # A reply to another register (a late ack of a timed-out command) does not answer the current one.
+        if (len(self._buf) >= 4 and len(self._buf) >= self._buf[3] + 7 and self._buf[1] == self._reply_reg
+                and self._reply and not self._reply.done()):
             self._reply.set_result(bytes(self._buf))
 
-    async def _transact(self, frame: bytes) -> bytes:
+    async def _transact(self, frame: bytes, before_write=None) -> bytes:
         async with self._lock:
+            if before_write:
+                before_write()
+            self._reply_reg = frame[2]
             self._reply = asyncio.get_running_loop().create_future()
-            await self._client.write_gatt_char(WRITE_UUID, frame, response=False)
-            resp = await asyncio.wait_for(self._reply, timeout=5.0)
+            try:
+                await self._client.write_gatt_char(WRITE_UUID, frame, response=False)
+                resp = await asyncio.wait_for(self._reply, timeout=5.0)
+            finally:
+                self._reply = None
         length = resp[3]
         if resp[2] != 0x00:
             raise IOError(f"BMS error status 0x{resp[2]:02X} for reg 0x{frame[2]:02X}")
@@ -118,17 +129,31 @@ class JbdBms:
     async def read_cells(self) -> list:
         return parse_cells(await self._transact(read_frame(REG_CELLS)))
 
-    async def set_mos(self, charge: bool, discharge: bool):
+    async def set_mos(self, charge: bool, discharge: bool, before_write=None):
+        """before_write runs once the link is free, right before the frame goes out; an exception from it cancels the write."""
         # Register E1 takes a "disable" mask: bit0 = charge off, bit1 = discharge off.
         mask = (0 if charge else 0x01) | (0 if discharge else 0x02)
-        await self._transact(write_frame(REG_MOS, bytes([0x00, mask])))
+        await self._transact(write_frame(REG_MOS, bytes([0x00, mask])), before_write)
 
 
 async def find_bms(timeout: float = 10.0):
     found = await BleakScanner.discover(timeout=timeout, return_adv=True)
-    for dev, adv in found.values():
-        if SERVICE_UUID in [u.lower() for u in adv.service_uuids]:
-            return dev.address, adv.local_name or dev.name
+    candidates = sorted(((adv.rssi, dev.address, adv.local_name or dev.name) for dev, adv in found.values()
+                         if SERVICE_UUID in [u.lower() for u in adv.service_uuids]), reverse=True)
+    # Other devices advertise FF00 too, so a candidate counts only once it answers a basic-info read.
+    for _rssi, address, name in candidates:
+        bms = JbdBms(address)
+        try:
+            await bms.connect()
+            await bms.read_basic()
+            return address, name
+        except Exception:
+            pass
+        finally:
+            try:
+                await bms.disconnect()
+            except Exception:
+                pass
     return None, None
 
 
