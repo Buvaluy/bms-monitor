@@ -23,11 +23,12 @@ PROTECTION_BITS = [
     "cell overvoltage", "cell undervoltage", "pack overvoltage", "pack undervoltage",
     "charge overtemp", "charge undertemp", "discharge overtemp", "discharge undertemp",
     "charge overcurrent", "discharge overcurrent", "short circuit", "front-end IC error",
-    "MOS software lock",
+    "MOS software lock", "charge timeout",
 ]
 
 GREEN, YELLOW, RED = 0, 1, 2
 LEVEL_COLORS = {GREEN: "#1a7f37", YELLOW: "#b58100", RED: "#cf222e"}
+INACTIVE_COLOR = "#a0a7ae"
 # (red below, yellow below, yellow above, red above); None = no limit. LiFePO4 4S, 140 Ah, 100 A BMS.
 THRESHOLDS = {
     "soc": (20, 50, None, None),
@@ -211,8 +212,17 @@ class App:
             self.vars[name] = tk.StringVar(value="--")
             self.value_labels[name] = ttk.Label(grid, textvariable=self.vars[name])
             self.value_labels[name].grid(row=i, column=1, sticky="w", **pad)
+        self.value_labels["Protection"].config(wraplength=420)
 
-        conn = ttk.Frame(self.root, padding=(8, 8, 8, 0))
+        prot_box = ttk.LabelFrame(self.root, text="All protections", padding=8)
+        prot_box.pack(fill="x", padx=8, pady=(8, 0))
+        self.prot_labels = {}
+        for i, name in enumerate(PROTECTION_BITS):
+            lbl = ttk.Label(prot_box, text=f"{i:>2}  {name}", foreground=INACTIVE_COLOR, width=24)
+            lbl.grid(row=i % 7, column=i // 7, sticky="w", padx=4)
+            self.prot_labels[name] = lbl
+
+        conn =ttk.Frame(self.root, padding=(8, 8, 8, 0))
         conn.pack(fill="x")
         self.refresh_btn = ttk.Button(conn, text="Refresh", command=self._refresh)
         self.refresh_btn.pack(side="left")
@@ -232,7 +242,7 @@ class App:
         self.dsg_btn.pack(side="left")
 
         self.status_var = tk.StringVar(value="Starting...")
-        ttk.Label(self.root, textvariable=self.status_var, foreground="gray",
+        ttk.Label(self.root, textvariable=self.status_var, foreground="gray", wraplength=500,
                   padding=(8, 0, 8, 8)).pack(fill="x")
         self._update_buttons()
 
@@ -287,8 +297,13 @@ class App:
         v["Cell delta"].set(f"{(max(cells) - min(cells)) * 1000:.0f} mV" if cells else "--")
         v["Switches"].set(f"Charging: {'enabled' if basic.charge_on else 'DISABLED'}, "
                           f"Output: {'enabled' if basic.discharge_on else 'DISABLED'}")
-        prot = [n for i, n in enumerate(PROTECTION_BITS) if basic.protection_mask >> i & 1]
+        prot = [PROTECTION_BITS[i] if i < len(PROTECTION_BITS) else f"bit {i}"
+                for i in range(16) if basic.protection_mask >> i & 1]
         v["Protection"].set(", ".join(prot) or "none")
+        for name, lbl in self.prot_labels.items():
+            on = name in prot
+            lbl.config(foreground=LEVEL_COLORS[RED] if on else INACTIVE_COLOR,
+                       font=("Segoe UI", 9, "bold" if on else "normal"))
         self._apply_levels(basic, cells, prot)
         self._update_buttons()
         self.updated_var.set(f"Updated: {time.strftime('%H:%M:%S')}")
@@ -320,11 +335,14 @@ class App:
             if name in self.value_labels:
                 self.value_labels[name].config(foreground=LEVEL_COLORS[lvl])
 
-        red_now = {n for n, lvl in levels.items() if lvl == RED and n not in ("Power", "Capacity")}
+        # Each protection is tracked on its own, so a new one notifies even while the row is already red.
+        red_now = {n for n, lvl in levels.items() if lvl == RED and n not in ("Power", "Capacity", "Protection")}
+        red_now |= {f"Protection: {p}" for p in prot}
         new = red_now - self.alerted
         self.alerted = red_now
         if new:
-            text = "; ".join(f"{n}: {self.soc_var.get() if n == 'SOC' else self.vars[n].get()}" for n in sorted(new))
+            text = "; ".join(n if n.startswith("Protection: ") else
+                             f"{n}: {self.soc_var.get() if n == 'SOC' else self.vars[n].get()}" for n in sorted(new))
             self.status_var.set(f"ALERT: {text}")
             self.tray.notify(text, "Battery alert")
 

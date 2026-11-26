@@ -16,6 +16,7 @@ CMD_CELL_INFO = 0x96
 CMD_DEVICE_INFO = 0x97
 FRAME_HEADER = b"\x55\xAA\xEB\x90"
 FRAME_LEN = 300
+TYPE_SETTINGS = 0x01
 TYPE_CELL_INFO = 0x02
 TYPE_DEVICE_INFO = 0x03
 
@@ -57,10 +58,20 @@ class CellInfo:
     mos_temp_c: float
     temps_c: list = field(default_factory=list)
     runtime_s: int = 0
+    heating: bool = False
+    heating_current: float = 0.0
+    precharging: bool = False
+    charger_plugged: bool = False
+    charge_stage: int = 0
+    recovery_s: dict = field(default_factory=dict)
+    dry_mask: int = 0
+    clock_s: int = 0
+    log_count: int = 0
 
     @property
     def alarms(self) -> list:
-        return [n for i, n in enumerate(ALARM_BITS) if self.alarm_mask >> i & 1]
+        return [ALARM_BITS[i] if i < len(ALARM_BITS) else f"bit {i}"
+                for i in range(32) if self.alarm_mask >> i & 1]
 
 
 def parse_cell_info(f: bytes) -> CellInfo:
@@ -70,8 +81,10 @@ def parse_cell_info(f: bytes) -> CellInfo:
     i32 = lambda o: struct.unpack_from("<i", f, o)[0]
     mask = u32(70)
     present = [k for k in range(32) if mask >> k & 1]
-    # Offsets 254.. hold extra sensors; -2000 (-200.0 °C) marks an unconnected one.
-    temps = [i16(o) / 10 for o in (162, 164, 256, 258)]
+    # T1, T2, then T3..T5 stored in reverse at 258..254; -2000 (-200.0 °C) marks an unconnected sensor.
+    temps = [i16(o) / 10 for o in (162, 164, 258, 256, 254)]
+    timers = {"charge OCP": 206, "charge SCP": 208, "discharge OCP": 202, "discharge SCP": 204,
+              "cell UVP": 210, "cell OVP": 212}
     return CellInfo(
         voltage=u32(150) / 1000,
         current=i32(158) / 1000,
@@ -92,13 +105,43 @@ def parse_cell_info(f: bytes) -> CellInfo:
         mos_temp_c=i16(144) / 10,
         temps_c=[t for t in temps if t > -100],
         runtime_s=u32(194),
+        heating=bool(f[215]),
+        heating_current=i16(236) / 1000,
+        precharging=bool(f[191]),
+        charger_plugged=bool(f[245]),
+        charge_stage=f[280],
+        recovery_s={name: u16(o) for name, o in timers.items()},
+        dry_mask=f[281],
+        clock_s=u32(262),
+        log_count=u32(266),
     )
+
+
+def parse_settings(f: bytes) -> dict:
+    u32 = lambda o: struct.unpack_from("<I", f, o)[0]
+    v = lambda o: u32(o) / 1000
+    t = lambda o: struct.unpack_from("<i", f, o)[0] / 10
+    s8 = lambda o: struct.unpack_from("<b", f, o)[0]
+    return {
+        "smart_sleep_v": v(6), "cell_uvp": v(10), "cell_uvp_rec": v(14), "cell_ovp": v(18),
+        "cell_ovp_rec": v(22), "balance_trigger_v": v(26), "soc100_v": v(30), "soc0_v": v(34),
+        "rcv": v(38), "rfv": v(42), "power_off_v": v(46),
+        "max_charge_a": v(50), "charge_ocp_delay_s": u32(54), "charge_ocp_rec_s": u32(58),
+        "max_discharge_a": v(62), "discharge_ocp_delay_s": u32(66), "discharge_ocp_rec_s": u32(70),
+        "scp_rec_s": u32(74), "max_balance_a": v(78),
+        "charge_otp": t(82), "charge_otp_rec": t(86), "discharge_otp": t(90), "discharge_otp_rec": t(94),
+        "charge_utp": t(98), "charge_utp_rec": t(102), "mos_otp": t(106), "mos_otp_rec": t(110),
+        "cell_count": f[114], "balancer_on": bool(f[126]), "nominal_ah": v(130), "scp_delay_us": u32(134),
+        "balance_start_v": v(138), "heat_start": s8(284), "heat_stop": s8(285), "smart_sleep_delay_h": f[286],
+        "discharge_utp": s8(296), "discharge_utp_rec": s8(297),
+    }
 
 
 def parse_device_info(f: bytes) -> dict:
     s = lambda a, b: f[a:b].split(b"\x00")[0].decode(errors="replace")
+    u32 = lambda o: struct.unpack_from("<I", f, o)[0]
     return {"model": s(6, 22), "hw": s(22, 30), "sw": s(30, 38), "name": s(46, 62),
-            "mfg_date": s(78, 86), "serial": s(86, 97)}
+            "mfg_date": s(78, 86), "serial": s(86, 97), "uptime_s": u32(38), "power_on_count": u32(42)}
 
 
 class JkBms:
@@ -156,20 +199,38 @@ class JkBms:
                 if attempt == attempts - 1:
                     raise TimeoutError(f"no reply to command 0x{cmd:02X}") from None
 
-    async def read_cell_info(self) -> CellInfo:
-        # After 0x96 the BMS keeps streaming cell info about once a second; reuse a fresh frame.
+    def cell_info_age(self) -> float:
+        return time.monotonic() - self._latest.get(TYPE_CELL_INFO, (float("-inf"), None))[0]
+
+    async def read_cell_info(self, max_age: float = 5.0) -> CellInfo:
+        # After 0x96 the BMS keeps streaming cell info about once a second; reuse a frame newer than max_age.
         ts, frame = self._latest.get(TYPE_CELL_INFO, (0.0, None))
-        if time.monotonic() - ts > 5.0:
+        if frame is None or time.monotonic() - ts > max_age:
             frame = await self._request(CMD_CELL_INFO, TYPE_CELL_INFO)
         return parse_cell_info(frame)
 
+    def latest_settings(self):
+        ts, frame = self._latest.get(TYPE_SETTINGS, (None, None))
+        return ts, parse_settings(frame) if frame else None
+
+    async def read_settings(self) -> dict:
+        # The BMS answers 0x97 with device info followed by the settings frame.
+        frame = await self._request(CMD_DEVICE_INFO, TYPE_SETTINGS)
+        self.device_info = parse_device_info(self._latest[TYPE_DEVICE_INFO][1])
+        return parse_settings(frame)
+
+
+async def find_all_bms(timeout: float = 10.0) -> list:
+    """Return [(address, name, rssi)] of advertising JK BMS units, strongest signal first."""
+    found = await BleakScanner.discover(timeout=timeout, return_adv=True)
+    return sorted(((dev.address, adv.local_name or dev.name or "?", adv.rssi) for dev, adv in found.values()
+                   if JK_MANUFACTURER_ID in adv.manufacturer_data
+                   and SERVICE_UUID in [u.lower() for u in adv.service_uuids]), key=lambda x: -x[2])
+
 
 async def find_bms(timeout: float = 10.0):
-    found = await BleakScanner.discover(timeout=timeout, return_adv=True)
-    for dev, adv in found.values():
-        if JK_MANUFACTURER_ID in adv.manufacturer_data and SERVICE_UUID in [u.lower() for u in adv.service_uuids]:
-            return dev.address, adv.local_name or dev.name
-    return None, None
+    found = await find_all_bms(timeout)
+    return found[0][:2] if found else (None, None)
 
 
 async def console(address: str = None):
