@@ -230,6 +230,7 @@ class App:
         self.tray_soc = None
         self.worker = None
         self.closing = False
+        self.scan_busy = False
         self.uptime_text = "--"
 
         self.root = tk.Tk()
@@ -326,6 +327,7 @@ class App:
 
     def _scan(self):
         if self.worker and self.connect_btn.cget("text") == "Disconnect":
+            self.scan_busy = True
             self.scan_btn.config(state="disabled")
             self.worker.scan()
 
@@ -346,11 +348,13 @@ class App:
 
         def finish(address):
             dlg.destroy()
+            self.scan_busy = False
             self.scan_btn.config(state="normal" if self.connect_btn.cget("text") == "Disconnect" else "disabled")
             self.worker.choose(address)
 
         def rescan():
             dlg.destroy()
+            self.scan_busy = False
             self.worker.choose("")
             self._scan()
 
@@ -372,7 +376,7 @@ class App:
         paused = self.connect_btn.cget("text") == "Disconnect"
         self.connect_btn.config(text="Connect" if paused else "Disconnect")
         self.refresh_btn.config(state="disabled" if paused else "normal")
-        self.scan_btn.config(state="disabled" if paused else "normal")
+        self.scan_btn.config(state="disabled" if paused or self.scan_busy else "normal")
         if self.worker:
             self.worker.set_paused(paused)
 

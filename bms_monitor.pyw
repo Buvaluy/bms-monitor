@@ -145,7 +145,7 @@ class BmsWorker:
                                     f"output {'enabled' if discharge else 'disabled'}")
                 self.wake.set()
             except Exception as e:
-                self.post("error", f"Switch command failed: {e}")
+                self.post("error", f"Switch command failed: {str(e) or type(e).__name__}")
         asyncio.run_coroutine_threadsafe(job(), self.loop)
 
 
