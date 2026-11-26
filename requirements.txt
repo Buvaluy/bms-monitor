@@ -1,0 +1,5 @@
+# Runtime dependencies of the JK and JBD BMS monitors; tested on Python 3.13.
+# Install with: py -3.13 -m pip install --user -r requirements.txt
+bleak>=3.0.2,<4
+pillow>=12.1
+pystray>=0.19.5

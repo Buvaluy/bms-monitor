@@ -8,6 +8,7 @@ from tkinter import ttk
 ALARM, THRESHOLD, LINK = "alarm", "threshold", "link"
 LINK_DOWN = "Link down"
 LIMIT = 1000
+MERGE_SECONDS = 30
 
 
 @dataclass
@@ -23,16 +24,22 @@ class Entry:
 
 
 class AlarmHistory:
-    """An entry opens when a condition appears and closes at the first frame without it."""
+    """An entry opens when a condition appears and closes at the first frame without it.
+
+    A condition that returns within MERGE_SECONDS reopens its entry and raises its count instead of adding a new one.
+    """
 
     def __init__(self):
         self.entries = []
         self._open = {}
+        self._closed = {}
 
     def _add(self, entry: Entry):
         self.entries.append(entry)
         if len(self.entries) > LIMIT:
-            del self.entries[next(i for i, e in enumerate(self.entries) if e.end is not None)]
+            old = self.entries.pop(next(i for i, e in enumerate(self.entries) if e.end is not None))
+            if self._closed.get(old.name) is old:
+                del self._closed[old.name]
 
     def observe(self, active: dict, now: float) -> bool:
         """Apply one frame: active maps a condition name to (kind, detail). Returns True if the list changed."""
@@ -41,14 +48,21 @@ class AlarmHistory:
             entry = self._open.get(name)
             if entry:
                 entry.last_seen = now
+                continue
+            entry = self._closed.get(name)
+            if entry and not entry.cut and now - entry.end <= MERGE_SECONDS:
+                entry.end, entry.last_seen = None, now
+                entry.count += 1
+                self._open[name] = entry
             else:
                 entry = self._open[name] = Entry(kind, name, detail, now, last_seen=now)
                 self._add(entry)
-                changed = True
+            changed = True
         for name, entry in list(self._open.items()):
             if entry.kind != LINK and name not in active:
                 entry.end = now
                 del self._open[name]
+                self._closed[name] = entry
                 changed = True
         return changed
 
