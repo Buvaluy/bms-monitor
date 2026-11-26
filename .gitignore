@@ -3,3 +3,5 @@ bms_config.json
 jk_config.json
 # Python bytecode cache.
 __pycache__/
+# Local Claude Code launcher, not part of the app.
+claude-empty.bat

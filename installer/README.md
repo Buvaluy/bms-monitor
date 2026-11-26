@@ -1,16 +1,17 @@
-# JK Monitor: building the exe and the installer
+# JK and JBD Monitor: building the exe and the installer
 
-This folder turns `jk_monitor.pyw` into a standalone `JK Monitor.exe`.
-That exe needs no Python on the target PC.
-It also wraps the exe into `JKMonitor-Setup.exe`, a per-user installer.
+This folder turns `jk_monitor.pyw` into a standalone `JK Monitor.exe` and `bms_monitor.pyw` into `JBD Monitor.exe`.
+Those exe files need no Python on the target PC.
+It also wraps them into `JKMonitor-Setup-<version>.exe` and `JBDMonitor-Setup-<version>.exe`, per-user installers.
+The version comes from `..\version.py`.
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `jk_monitor.spec` | PyInstaller spec: one folder build, no console window, adds `pystray._win32`, leaves out the `test_*` modules. |
-| `jk_monitor.iss` | Inno Setup script: installs to `%LOCALAPPDATA%\Programs\JK Monitor` without admin rights, has an optional autostart task and an uninstaller. |
-| `build_installer.bat` | Runs PyInstaller, then Inno Setup. |
+| `jk_monitor.spec`, `bms_monitor.spec` | PyInstaller specs: one folder build, no console window, adds `pystray._win32`, leaves out the `test_*` modules. |
+| `jk_monitor.iss`, `bms_monitor.iss` | Inno Setup scripts: install to `%LOCALAPPDATA%\Programs\<app name>` without admin rights, have an optional autostart task and an uninstaller. |
+| `build_installer.bat` | Reads the version, runs PyInstaller, then Inno Setup, for both apps. Set `PYTHON` to use another interpreter than `py -3.13`. |
 | `.gitignore` | Keeps `build/`, `dist/` and `Output/` out of git. |
 
 ## 1. One-time setup on the build PC
@@ -34,11 +35,13 @@ Versions used for the first build: PyInstaller 6.22.3, bleak 3.0.2, pystray 0.19
 Run `installer\build_installer.bat`.
 It can be started from any folder, because it changes into its own folder first.
 
-The bat runs two steps:
-1. `py -3.13 -m PyInstaller --noconfirm --clean jk_monitor.spec` writes `dist\JK Monitor\JK Monitor.exe` and its `_internal\` folder.
-2. `ISCC.exe /Q jk_monitor.iss` packs `dist\JK Monitor\` into `Output\JKMonitor-Setup.exe` (about 23 MB).
+The bat runs these steps (shown for JK; JBD is the same with `bms_monitor` and `JBD Monitor`):
+1. Reads `__version__` from `..\version.py`.
+2. `py -3.13 -m PyInstaller --noconfirm --clean jk_monitor.spec` writes `dist\JK Monitor\JK Monitor.exe` and its `_internal\` folder.
+3. `ISCC.exe /Q /DAppVersion=<version> jk_monitor.iss` packs `dist\JK Monitor\` into `Output\JKMonitor-Setup-<version>.exe` (about 23 MB).
 
-The bat stops with exit code 1 if either step fails.
+The bat stops with exit code 1 if any step fails.
+The GitHub release workflow runs the same bat; see the "Releases" section of the top-level `README.md`.
 
 ## 3. Check the build
 
@@ -47,10 +50,10 @@ The bat stops with exit code 1 if either step fails.
    Any missing `winrt`, `bleak.backends.winrt`, `PIL` or `tkinter` module is a real problem.
 2. Check that `dist\JK Monitor\_internal\` contains `winrt`, `PIL`, `tcl86t.dll` and `_tcl_data`.
 3. Start `dist\JK Monitor\JK Monitor.exe`.
-   The `JK BMS Monitor` window must open without an error dialog.
+   The `JK BMS Monitor <version>` window must open without an error dialog.
 4. Test the installer silently and remove it again:
    ```
-   Output\JKMonitor-Setup.exe /VERYSILENT /SUPPRESSMSGBOXES /TASKS=autostart
+   Output\JKMonitor-Setup-<version>.exe /VERYSILENT /SUPPRESSMSGBOXES /TASKS=autostart
    "%LOCALAPPDATA%\Programs\JK Monitor\unins000.exe" /VERYSILENT /SUPPRESSMSGBOXES
    ```
    After installing, `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` has a `JK Monitor` value

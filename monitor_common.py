@@ -12,6 +12,7 @@ import tkinter as tk
 import pystray
 
 from alarm_history import LINK, AlarmHistory, HistoryWindow, clock
+from version import __version__
 
 # A tray balloon reports a lost link only if it stays lost this long, so short drops do not notify.
 LINK_ALERT_SECONDS = 300
@@ -181,7 +182,7 @@ class MonitorApp:
         self.link_alerted = False
 
         self.root = tk.Tk()
-        self.root.title(self.window_title)
+        self.root.title(f"{self.window_title} {__version__}")
         self.root.resizable(False, False)
         self.root.protocol("WM_DELETE_WINDOW", self.root.withdraw)
         self.root.bind("<<BmsEvent>>", lambda _e: self._pump())
