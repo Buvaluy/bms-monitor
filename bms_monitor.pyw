@@ -10,7 +10,7 @@ from tkinter import messagebox, ttk
 from PIL import Image, ImageDraw, ImageFont
 
 from alarm_history import ALARM, LINK, THRESHOLD
-from jbd_bms import JbdBms, find_bms
+from jbd_bms import JbdBms, find_all_bms, find_bms
 from monitor_common import MonitorApp, MonitorWorker, read_config, run_app, write_config
 
 CONFIG_PATH = Path(__file__).with_name("bms_config.json")
@@ -98,6 +98,8 @@ class UserDisconnected(Exception):
 
 
 class BmsWorker(MonitorWorker):
+    scan_status = "Scanning for JBD BMS (10 s, then a check of each one)..."
+
     def __init__(self, post):
         # Register E1 sets both MOSFETs at once; this is its "disable" mask as this monitor last sent it.
         self.mos_off = 0
@@ -123,6 +125,12 @@ class BmsWorker(MonitorWorker):
         basic = await self.bms.read_basic()
         cells = await self.bms.read_cells()
         self.post("data", (basic, cells))
+
+    async def _find_all(self) -> list:
+        return await find_all_bms()
+
+    def _bms_changed(self):
+        self.mos_off = 0
 
     def refresh(self):
         self.loop.call_soon_threadsafe(self.wake.set)
@@ -193,6 +201,7 @@ def tray_image(soc) -> Image.Image:
 
 class App(MonitorApp):
     worker_class = BmsWorker
+    bms_kind = "JBD BMS"
     window_title = "BMS Monitor"
     tray_name = "bms"
     tray_idle_title = "BMS: no data"
@@ -241,7 +250,9 @@ class App(MonitorApp):
         self.refresh_btn = ttk.Button(conn, text="Refresh", command=self._refresh)
         self.refresh_btn.pack(side="left")
         self.connect_btn = ttk.Button(conn, text="Disconnect", command=self._toggle_connection)
-        self.connect_btn.pack(side="left", padx=8)
+        self.connect_btn.pack(side="left", padx=(8, 0))
+        self.scan_btn = ttk.Button(conn, text="Scan", command=self._scan)
+        self.scan_btn.pack(side="left", padx=8)
         self.history_btn = ttk.Button(conn, text="History", command=self._show_history)
         self.history_btn.pack(side="left", padx=(0, 8))
         self.updated_var = tk.StringVar(value="Updated: --")
@@ -266,9 +277,16 @@ class App(MonitorApp):
         paused = self.connect_btn.cget("text") == "Disconnect"
         self.connect_btn.config(text="Connect" if paused else "Disconnect")
         self.refresh_btn.config(state="disabled" if paused else "normal")
+        self.scan_btn.config(state="disabled" if paused or self.scan_busy else "normal")
         self._update_buttons()
         if self.worker:
             self.worker.set_paused(paused)
+
+    def _forget_bms(self, address: str):
+        """Another BMS was chosen: the switch buttons wait for its first reading."""
+        self.last_basic = None
+        self._update_buttons()
+        super()._forget_bms(address)
 
     def _update_buttons(self):
         b = self.last_basic

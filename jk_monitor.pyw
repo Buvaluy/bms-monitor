@@ -9,7 +9,7 @@ from tkinter import ttk
 
 from PIL import Image, ImageDraw, ImageFont
 
-from alarm_history import ALARM, LINK, THRESHOLD
+from alarm_history import ALARM, THRESHOLD
 from jk_bms import ALARM_BITS, NOTICE_ALARMS, SETTINGS_STREAM_SECONDS, JkBms, find_all_bms, find_bms
 from monitor_common import MonitorApp, MonitorWorker, read_config, run_app, write_config
 
@@ -17,8 +17,6 @@ CONFIG_PATH = Path(__file__).with_name("jk_config.json")
 POLL_SECONDS = 5
 # Without a streamed frame for this long, the monitor sends an explicit cell-info request; also the reconnect delay.
 REQUEST_SECONDS = 120
-# The BMS is not polled while the Scan dialog is open, so an unanswered dialog closes itself to resume alarms.
-SCAN_CHOICE_SECONDS = 120
 
 GREEN, YELLOW, RED = 0, 1, 2
 # Darker than the JBD monitor's palette so the two windows are easy to tell apart.
@@ -48,11 +46,6 @@ JK_EPOCH = 1577836800 - 8 * 3600
 def duration(seconds: int) -> str:
     days, rest = divmod(seconds, 86400)
     return f"{days} d {rest // 3600} h"
-
-
-def signal_bars(rssi: int) -> str:
-    lit = 1 + sum(rssi >= t for t in (-87, -79, -71, -63, -55))
-    return "▁▂▃▄▅▆"[:lit] + "·" * (6 - lit)
 
 
 def level(key: str, value: float) -> int:
@@ -112,11 +105,10 @@ def save_config(cfg: dict):
 
 
 class BmsWorker(MonitorWorker):
+    scan_status = "Scanning for JK BMS (10 s)..."
+
     def __init__(self, post):
         self.force = False
-        self.scan_requested = False
-        self.scanning = False
-        self.choice = None
         super().__init__(post, POLL_SECONDS, REQUEST_SECONDS, load_config, save_config, CONFIG_PATH.name)
 
     async def _poll_once(self, cfg: dict):
@@ -150,43 +142,12 @@ class BmsWorker(MonitorWorker):
         if force or age <= POLL_SECONDS or age > REQUEST_SECONDS:
             self.post("data", await self.bms.read_cell_info(max_age=0 if force else REQUEST_SECONDS))
 
-    async def _handle_requests(self, cfg: dict) -> bool:
-        if self.choice is not None:
-            address, self.choice = self.choice, None
-            if address and address != cfg.get("address"):
-                await self._disconnect()
-                cfg["address"] = address
-                self._save(cfg)
-            self.scanning = False
-        if self.scan_requested:
-            self.scan_requested, self.scanning = False, True
-            # A connected BMS does not advertise, so the current one is released to show up in the list.
-            await self._disconnect()
-            self.post("status", "Scanning for JK BMS (10 s)...")
-            try:
-                self.post("scan", (await find_all_bms(), cfg.get("address")))
-            except Exception as e:
-                self.post("scan", ([], cfg.get("address")))
-                self.post("status", f"Scan failed: {str(e) or type(e).__name__}")
-            return True
-        return self.scanning
+    async def _find_all(self) -> list:
+        return await find_all_bms()
 
     def refresh(self):
         def apply():
             self.force = True
-            self.wake.set()
-        self.loop.call_soon_threadsafe(apply)
-
-    def scan(self):
-        def apply():
-            self.scan_requested = True
-            self.wake.set()
-        self.loop.call_soon_threadsafe(apply)
-
-    def choose(self, address):
-        """Finish a scan: connect to address, or pass "" to keep the configured BMS."""
-        def apply():
-            self.choice = address
             self.wake.set()
         self.loop.call_soon_threadsafe(apply)
 
@@ -215,6 +176,7 @@ def tray_image(soc) -> Image.Image:
 
 class App(MonitorApp):
     worker_class = BmsWorker
+    bms_kind = "JK BMS"
     window_title = "JK BMS Monitor"
     tray_name = "jk_bms"
     tray_idle_title = "JK BMS: no data"
@@ -224,7 +186,6 @@ class App(MonitorApp):
     tray_image = staticmethod(tray_image)
 
     def __init__(self):
-        self.scan_busy = False
         self.uptime_text = "--"
         super().__init__()
 
@@ -293,63 +254,6 @@ class App(MonitorApp):
         ttk.Label(self.root, textvariable=self.status_var, foreground="gray", wraplength=500,
                   padding=(8, 8, 8, 8)).pack(fill="x")
 
-    def _scan(self):
-        if self.worker and self.connect_btn.cget("text") == "Disconnect":
-            self.scan_busy = True
-            self.scan_btn.config(state="disabled")
-            self.worker.scan()
-
-    def _show_scan(self, found: list, current: str):
-        self.status_var.set(f"Found {len(found)} JK BMS; choose one or Cancel")
-        self.root.deiconify()
-        dlg = tk.Toplevel(self.root)
-        dlg.title("Choose JK BMS")
-        dlg.resizable(False, False)
-        dlg.transient(self.root)
-        lb = tk.Listbox(dlg, width=66, height=max(3, min(len(found), 8)), font=("Cascadia Mono", 10))
-        lb.pack(padx=8, pady=8)
-        for address, name, rssi in found:
-            lb.insert("end", f"{name:<18} {address}  {signal_bars(rssi)}  {rssi} dBm" + ("  (current)" if address == current else ""))
-        if found:
-            lb.selection_set(0)
-        else:
-            lb.insert("end", "No JK BMS found; disconnect the phone and rescan")
-
-        def close_dialog():
-            dlg.after_cancel(timeout)
-            dlg.destroy()
-
-        def finish(address):
-            close_dialog()
-            self.scan_busy = False
-            self.scan_btn.config(state="normal" if self.connect_btn.cget("text") == "Disconnect" else "disabled")
-            if address and address != current:
-                self._forget_bms(address)
-            self.worker.choose(address)
-
-        def rescan():
-            if self.connect_btn.cget("text") != "Disconnect":
-                finish("")
-                return
-            close_dialog()
-            # The worker checks a scan request before the open choice, so no choose("") is sent to race with it.
-            self.worker.scan()
-
-        def connect():
-            sel = lb.curselection()
-            if found and sel:
-                finish(found[sel[0]][0])
-
-        buttons = ttk.Frame(dlg, padding=(8, 0, 8, 8))
-        buttons.pack(fill="x")
-        ttk.Button(buttons, text="Connect", command=connect,
-                   state="normal" if found else "disabled").pack(side="left")
-        ttk.Button(buttons, text="Rescan", command=rescan).pack(side="left", padx=8)
-        ttk.Button(buttons, text="Cancel", command=lambda: finish("")).pack(side="right")
-        lb.bind("<Double-Button-1>", lambda _e: connect())
-        dlg.protocol("WM_DELETE_WINDOW", lambda: finish(""))
-        timeout = dlg.after(SCAN_CHOICE_SECONDS * 1000, lambda: finish(""))
-
     def _toggle_connection(self):
         paused = self.connect_btn.cget("text") == "Disconnect"
         self.connect_btn.config(text="Connect" if paused else "Disconnect")
@@ -359,15 +263,13 @@ class App(MonitorApp):
             self.worker.set_paused(paused)
 
     def _forget_bms(self, address: str):
-        """Another BMS was chosen: drop the alert state, device row and settings read from the previous one."""
-        self.alerted = set()
+        """Another BMS was chosen: also drop the device row and settings read from the previous one."""
         THRESHOLDS["mos_temp_c"] = DEFAULT_MOS_TEMP
         self.uptime_text = "--"
         self.vars["Device"].set("--")
         for name in SETTING_ROWS:
             self.detail_vars[name].set("--")
-        if self.history.note(LINK, "BMS changed", address, time.time()):
-            self._history_changed()
+        super()._forget_bms(address)
 
     def _show_device(self, info: dict):
         self.vars["Device"].set(f"{info['model']}  hw {info['hw']}  sw {info['sw']}  s/n {info['serial']}")
@@ -479,18 +381,6 @@ class App(MonitorApp):
             self._show_device(payload)
         elif kind == "settings":
             self._show_settings(payload)
-        elif kind == "scan":
-            self._show_scan(*payload)
-
-    def _track_other_status(self, text: str, now: float) -> bool:
-        if text.startswith("Scan failed"):
-            return self.history.note(LINK, "Scan failed", text, now)
-        if text.startswith("Scanning"):
-            changed = self.history.cut(now)
-            # "Scanning" also comes from the automatic search when no address is saved; only a Scan click is the user's.
-            self._link_lost(by_user=self.scan_busy)
-            return changed
-        return False
 
 
 if __name__ == "__main__":
