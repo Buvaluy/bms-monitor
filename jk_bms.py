@@ -19,6 +19,8 @@ FRAME_LEN = 300
 TYPE_SETTINGS = 0x01
 TYPE_CELL_INFO = 0x02
 TYPE_DEVICE_INFO = 0x03
+# The settings frame follows device info; a command sent while it streams is ignored.
+SETTINGS_STREAM_SECONDS = 2.0
 
 ALARM_BITS = [
     "wire resistance", "MOS overtemp", "cell count", "current sensor", "cell overvoltage",
@@ -145,8 +147,10 @@ def parse_device_info(f: bytes) -> dict:
 
 
 class JkBms:
-    def __init__(self, address: str):
+    def __init__(self, address: str, on_cell_info=None):
+        """on_cell_info(CellInfo) is called for every streamed cell-info frame, not only the ones read."""
         self.address = address
+        self.on_cell_info = on_cell_info
         self.device_info = {}
         self._client = None
         self._buf = bytearray()
@@ -162,8 +166,7 @@ class JkBms:
         await self._client.connect()
         await self._client.start_notify(CHAR_UUID, self._on_notify)
         self.device_info = parse_device_info(await self._request(CMD_DEVICE_INFO, TYPE_DEVICE_INFO))
-        # The settings frame follows device info; a command sent while it streams is ignored.
-        await asyncio.sleep(2.0)
+        await asyncio.sleep(SETTINGS_STREAM_SECONDS)
 
     async def disconnect(self):
         if self._client:
@@ -178,10 +181,13 @@ class JkBms:
         self._buf += data
         while (start := self._buf.find(FRAME_HEADER)) >= 0 and len(self._buf) - start >= FRAME_LEN:
             frame = bytes(self._buf[start:start + FRAME_LEN])
-            del self._buf[:start + FRAME_LEN]
             if sum(frame[:-1]) & 0xFF != frame[-1]:
+                del self._buf[:start + 1]
                 continue
+            del self._buf[:start + FRAME_LEN]
             self._latest[frame[4]] = (time.monotonic(), frame)
+            if frame[4] == TYPE_CELL_INFO and self.on_cell_info:
+                self.on_cell_info(parse_cell_info(frame))
             w = self._waiters.pop(frame[4], None)
             if w and not w.done():
                 w.set_result(frame)
@@ -240,9 +246,9 @@ async def console(address: str = None):
             sys.exit("JK BMS not found")
         print(f"found {name} at {address}")
     bms = JkBms(address)
-    await bms.connect()
-    print(bms.device_info)
     try:
+        await bms.connect()
+        print(bms.device_info)
         while True:
             c = await bms.read_cell_info()
             print(f"SOC {c.soc}%  {c.voltage:.3f} V  {c.current:+.3f} A  {c.power:+.1f} W  "

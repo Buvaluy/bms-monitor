@@ -14,6 +14,7 @@ from tkinter import messagebox, ttk
 import pystray
 from PIL import Image, ImageDraw, ImageFont
 
+from alarm_history import ALARM, LINK, THRESHOLD, AlarmHistory, HistoryWindow
 from jbd_bms import JbdBms, find_bms
 
 CONFIG_PATH = Path(__file__).with_name("bms_config.json")
@@ -50,6 +51,42 @@ def level(key: str, value: float) -> int:
     return GREEN
 
 
+def value_levels(basic, cells, prot) -> dict:
+    # JBD reports charge current as positive, discharge as negative.
+    if basic.current >= 0:
+        current_level = level("charge_a", basic.current)
+    else:
+        current_level = level("discharge_a", -basic.current)
+    return {
+        "SOC": level("soc", basic.soc),
+        "Voltage": level("pack_v", basic.voltage),
+        "Current": current_level,
+        "Power": current_level,
+        "Capacity": level("soc", basic.soc),
+        "Temperature": max((level("temp_c", t) for t in basic.temps_c), default=GREEN),
+        "Cells": max((level("cell_v", c) for c in cells), default=GREEN),
+        "Cell delta": level("cell_delta_mv", (max(cells) - min(cells)) * 1000) if cells else GREEN,
+        "Switches": GREEN if basic.charge_on and basic.discharge_on else YELLOW,
+        "Protection": RED if prot else GREEN,
+    }
+
+
+def poll_conditions(basic, cells, prot) -> dict:
+    """Return {name: (kind, detail)} for every protection bit and every value past its red limit in one poll."""
+    texts = {
+        "SOC": f"{basic.soc}%",
+        "Voltage": f"{basic.voltage:.2f} V",
+        "Current": f"{basic.current:+.2f} A",
+        "Temperature": "  ".join(f"{t:.1f} °C" for t in basic.temps_c),
+        "Cells": f"{min(cells):.3f} .. {max(cells):.3f} V" if cells else "",
+        "Cell delta": f"{(max(cells) - min(cells)) * 1000:.0f} mV" if cells else "",
+    }
+    levels = value_levels(basic, cells, prot)
+    found = {name: (THRESHOLD, text) for name, text in texts.items() if levels[name] == RED}
+    found.update({f"Protection: {p}": (ALARM, "") for p in prot})
+    return found
+
+
 def load_config() -> dict:
     try:
         return json.loads(CONFIG_PATH.read_text())
@@ -70,9 +107,13 @@ class BmsWorker:
         self.bms = None
         self.paused = False
         self.wake = asyncio.Event()
+        self.task = None
         threading.Thread(target=self.loop.run_forever, daemon=True).start()
-        asyncio.run_coroutine_threadsafe(self._run(), self.loop).add_done_callback(
-            lambda f: self.post("status", f"Worker stopped: {f.exception()!r}; restart the monitor"))
+        asyncio.run_coroutine_threadsafe(self._run(), self.loop).add_done_callback(self._on_stopped)
+
+    def _on_stopped(self, f):
+        if not f.cancelled() and f.exception() is not None:
+            self.post("status", f"Worker stopped: {f.exception()!r}; restart the monitor")
 
     async def _disconnect(self):
         if self.bms:
@@ -101,6 +142,7 @@ class BmsWorker:
         self.post("data", (basic, cells))
 
     async def _run(self):
+        self.task = asyncio.current_task()
         cfg = load_config()
         while True:
             if self.paused:
@@ -128,9 +170,12 @@ class BmsWorker:
         self.loop.call_soon_threadsafe(apply)
 
     def close(self):
-        """Release the BLE connection before exit; paused keeps the loop from reconnecting."""
+        """Stop the poll loop, including a connect in progress, then release the BLE connection before exit."""
         async def job():
             self.paused = True
+            if self.task:
+                self.task.cancel()
+                await asyncio.gather(self.task, return_exceptions=True)
             await self._disconnect()
         return asyncio.run_coroutine_threadsafe(job(), self.loop)
 
@@ -175,6 +220,8 @@ class App:
         self.events = queue.Queue()
         self.last_basic = None
         self.alerted = set()
+        self.history = AlarmHistory()
+        self.history_win = None
         self.tray_soc = None
         self.worker = None
         self.closing = False
@@ -240,6 +287,8 @@ class App:
         self.refresh_btn.pack(side="left")
         self.connect_btn = ttk.Button(conn, text="Disconnect", command=self._toggle_connection)
         self.connect_btn.pack(side="left", padx=8)
+        self.history_btn = ttk.Button(conn, text="History", command=self._show_history)
+        self.history_btn.pack(side="left", padx=(0, 8))
         self.updated_var = tk.StringVar(value="Updated: --")
         ttk.Label(conn, textvariable=self.updated_var, foreground="gray").pack(side="left")
 
@@ -296,6 +345,8 @@ class App:
             self.worker.set_mos(charge, discharge)
 
     def _show_data(self, basic, cells):
+        if self.status_var.get() == "Refreshing...":
+            self.status_var.set("Refreshed")
         self.last_basic = basic
         self.soc_var.set(f"{basic.soc}%")
         self.soc_bar["value"] = basic.soc
@@ -319,6 +370,8 @@ class App:
             lbl.config(foreground=LEVEL_COLORS[RED] if on else INACTIVE_COLOR,
                        font=("Segoe UI", 9, "bold" if on else "normal"))
         self._apply_levels(basic, cells, prot)
+        if self.history.observe(poll_conditions(basic, cells, prot), time.time()):
+            self._history_changed()
         self._update_buttons()
         self.updated_var.set(f"Updated: {time.strftime('%H:%M:%S')}")
         if basic.soc != self.tray_soc:
@@ -327,23 +380,7 @@ class App:
         self.tray.title = f"BMS {basic.soc}%  {basic.voltage:.2f} V  {basic.current:+.2f} A"
 
     def _apply_levels(self, basic, cells, prot):
-        # JBD reports charge current as positive, discharge as negative.
-        if basic.current >= 0:
-            current_level = level("charge_a", basic.current)
-        else:
-            current_level = level("discharge_a", -basic.current)
-        levels = {
-            "SOC": level("soc", basic.soc),
-            "Voltage": level("pack_v", basic.voltage),
-            "Current": current_level,
-            "Power": current_level,
-            "Capacity": level("soc", basic.soc),
-            "Temperature": max((level("temp_c", t) for t in basic.temps_c), default=GREEN),
-            "Cells": max((level("cell_v", c) for c in cells), default=GREEN),
-            "Cell delta": level("cell_delta_mv", (max(cells) - min(cells)) * 1000) if cells else GREEN,
-            "Switches": GREEN if basic.charge_on and basic.discharge_on else YELLOW,
-            "Protection": RED if prot else GREEN,
-        }
+        levels = value_levels(basic, cells, prot)
         self.soc_label.config(foreground=LEVEL_COLORS[levels["SOC"]])
         for name, lvl in levels.items():
             if name in self.value_labels:
@@ -367,8 +404,11 @@ class App:
                 self._show_data(*payload)
             elif kind == "status":
                 self.status_var.set(payload)
+                self._track_status(payload)
             elif kind == "error":
                 self.status_var.set(payload)
+                if self.history.note(LINK, "Command failed", payload, time.time()):
+                    self._history_changed()
                 messagebox.showerror("BMS", payload, parent=self.root)
             elif kind == "show":
                 self.root.deiconify()
@@ -379,6 +419,32 @@ class App:
                 self.tray.stop()
                 self._finish_exit(self.worker.close() if self.worker else None, time.monotonic() + 5)
                 return
+
+    def _track_status(self, text: str):
+        now = time.time()
+        if text.startswith(("Error:", "Worker stopped")):
+            changed = self.history.link_down(text, now)
+        elif text.startswith("Connected to"):
+            changed = self.history.link_up(now)
+        elif text.startswith("Disconnected;"):
+            changed = self.history.cut(now)
+        else:
+            changed = False
+        if changed:
+            self._history_changed()
+
+    def _history_changed(self):
+        active = self.history.active_count()
+        self.history_btn.config(text=f"History ({len(self.history.entries)}"
+                                     + (f", {active} active)" if active else ")"))
+        if self.history_win and self.history_win.alive():
+            self.history_win.refresh()
+
+    def _show_history(self):
+        if self.history_win and self.history_win.alive():
+            self.history_win.show()
+        else:
+            self.history_win = HistoryWindow(self.root, self.history, "JBD BMS: session history")
 
     def _finish_exit(self, fut, deadline):
         # Tk keeps running while the worker disconnects, so a worker post cannot block the disconnect.

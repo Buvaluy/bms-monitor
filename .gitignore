@@ -1,0 +1,3 @@
+# Runtime config: the monitors rewrite it with the chosen BMS address.
+bms_config.json
+jk_config.json
