@@ -48,6 +48,11 @@ def duration(seconds: int) -> str:
     return f"{days} d {rest // 3600} h"
 
 
+def signal_bars(rssi: int) -> str:
+    lit = 1 + sum(rssi >= t for t in (-87, -79, -71, -63, -55))
+    return "▁▂▃▄▅▆"[:lit] + "·" * (6 - lit)
+
+
 def level(key: str, value: float) -> int:
     red_lo, yel_lo, yel_hi, red_hi = THRESHOLDS[key]
     if (red_lo is not None and value < red_lo) or (red_hi is not None and value > red_hi):
@@ -82,7 +87,8 @@ class BmsWorker:
         self.choice = None
         self.wake = asyncio.Event()
         threading.Thread(target=self.loop.run_forever, daemon=True).start()
-        asyncio.run_coroutine_threadsafe(self._run(), self.loop)
+        asyncio.run_coroutine_threadsafe(self._run(), self.loop).add_done_callback(
+            lambda f: self.post("status", f"Worker stopped: {f.exception()!r}; restart the monitor"))
 
     async def _disconnect(self):
         if self.bms:
@@ -128,7 +134,10 @@ class BmsWorker:
                 if address and address != cfg.get("address"):
                     await self._disconnect()
                     cfg["address"] = address
-                    save_config(cfg)
+                    try:
+                        save_config(cfg)
+                    except OSError as e:
+                        self.post("status", f"Could not save {CONFIG_PATH.name}: {e}")
                 self.scanning = False
             if self.scan_requested:
                 self.scan_requested, self.scanning = False, True
@@ -139,7 +148,7 @@ class BmsWorker:
                     self.post("scan", (await find_all_bms(), cfg.get("address")))
                 except Exception as e:
                     self.post("scan", ([], cfg.get("address")))
-                    self.post("status", f"Scan failed: {e or type(e).__name__}")
+                    self.post("status", f"Scan failed: {str(e) or type(e).__name__}")
             elif self.scanning:
                 pass
             elif self.paused:
@@ -152,7 +161,7 @@ class BmsWorker:
                 except Exception as e:
                     await self._disconnect()
                     delay = REQUEST_SECONDS
-                    self.post("status", f"Error: {e or type(e).__name__}; next try in {REQUEST_SECONDS // 60} min or on Refresh")
+                    self.post("status", f"Error: {str(e) or type(e).__name__}; next try in {REQUEST_SECONDS // 60} min or on Refresh")
             try:
                 await asyncio.wait_for(self.wake.wait(), timeout=delay)
             except asyncio.TimeoutError:
@@ -184,6 +193,13 @@ class BmsWorker:
             self.wake.set()
         self.loop.call_soon_threadsafe(apply)
 
+    def close(self):
+        """Release the BLE connection before exit; paused keeps the loop from reconnecting."""
+        async def job():
+            self.paused = True
+            await self._disconnect()
+        return asyncio.run_coroutine_threadsafe(job(), self.loop)
+
 
 def tray_image(soc) -> Image.Image:
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
@@ -213,6 +229,7 @@ class App:
         self.alerted = set()
         self.tray_soc = None
         self.worker = None
+        self.closing = False
         self.uptime_text = "--"
 
         self.root = tk.Tk()
@@ -308,7 +325,7 @@ class App:
             self.worker.refresh()
 
     def _scan(self):
-        if self.worker:
+        if self.worker and self.connect_btn.cget("text") == "Disconnect":
             self.scan_btn.config(state="disabled")
             self.worker.scan()
 
@@ -318,10 +335,10 @@ class App:
         dlg.title("Choose JK BMS")
         dlg.resizable(False, False)
         dlg.transient(self.root)
-        lb = tk.Listbox(dlg, width=60, height=max(3, min(len(found), 8)), font=("Consolas", 10))
+        lb = tk.Listbox(dlg, width=66, height=max(3, min(len(found), 8)), font=("Cascadia Mono", 10))
         lb.pack(padx=8, pady=8)
         for address, name, rssi in found:
-            lb.insert("end", f"{name:<18} {address}  {rssi} dBm" + ("  (current)" if address == current else ""))
+            lb.insert("end", f"{name:<18} {address}  {signal_bars(rssi)}  {rssi} dBm" + ("  (current)" if address == current else ""))
         if found:
             lb.selection_set(0)
         else:
@@ -329,7 +346,7 @@ class App:
 
         def finish(address):
             dlg.destroy()
-            self.scan_btn.config(state="normal")
+            self.scan_btn.config(state="normal" if self.connect_btn.cget("text") == "Disconnect" else "disabled")
             self.worker.choose(address)
 
         def rescan():
@@ -355,6 +372,7 @@ class App:
         paused = self.connect_btn.cget("text") == "Disconnect"
         self.connect_btn.config(text="Connect" if paused else "Disconnect")
         self.refresh_btn.config(state="disabled" if paused else "normal")
+        self.scan_btn.config(state="disabled" if paused else "normal")
         if self.worker:
             self.worker.set_paused(paused)
 
@@ -375,7 +393,7 @@ class App:
                                 f"balance {s['max_balance_a']:.1f} A")
         d["OCP / SCP"].set(f"charge delay {s['charge_ocp_delay_s']} s, recovery {s['charge_ocp_rec_s']} s; "
                            f"discharge delay {s['discharge_ocp_delay_s']} s, recovery {s['discharge_ocp_rec_s']} s; "
-                           f"SCP delay {s['scp_delay_us']}, recovery {s['scp_rec_s']} s")
+                           f"SCP delay {s['scp_delay_us']} µs, recovery {s['scp_rec_s']} s")
         d["Balancer"].set(f"{'on' if s['balancer_on'] else 'OFF'}, start {s['balance_start_v']:.3f} V, "
                           f"trigger {s['balance_trigger_v'] * 1000:.0f} mV")
         d["Charge temp"].set(f"OTP {s['charge_otp']:.0f} / {s['charge_otp_rec']:.0f} °C, "
@@ -384,7 +402,7 @@ class App:
                                 f"UTP {s['discharge_utp']} / {s['discharge_utp_rec']} °C")
         d["MOS OTP"].set(f"{s['mos_otp']:.0f} °C, recovery {s['mos_otp_rec']:.0f} °C")
         d["Heater"].set(f"start {s['heat_start']} °C, stop {s['heat_stop']} °C")
-        d["Smart sleep"].set(f"{s['smart_sleep_v']:.3f} V, delay {s['smart_sleep_delay_h']}")
+        d["Smart sleep"].set(f"{s['smart_sleep_v']:.3f} V, delay {s['smart_sleep_delay_h']} h")
         d["Battery"].set(f"{s['nominal_ah']:.0f} Ah, {s['cell_count']} cells")
 
     def _show_data(self, c):
@@ -465,7 +483,7 @@ class App:
             self.tray.notify(text, "JK battery alert")
 
     def _pump(self):
-        while not self.events.empty():
+        while not self.closing and not self.events.empty():
             kind, payload = self.events.get()
             if kind == "data":
                 self._show_data(payload)
@@ -481,9 +499,18 @@ class App:
                 self.root.deiconify()
                 self.root.lift()
             elif kind == "exit":
+                self.closing = True
+                self.root.withdraw()
                 self.tray.stop()
-                self.root.destroy()
+                self._finish_exit(self.worker.close() if self.worker else None, time.monotonic() + 5)
                 return
+
+    def _finish_exit(self, fut, deadline):
+        # Tk keeps running while the worker disconnects, so a worker post cannot block the disconnect.
+        if fut and not fut.done() and time.monotonic() < deadline:
+            self.root.after(100, self._finish_exit, fut, deadline)
+        else:
+            self.root.destroy()
 
 
 if __name__ == "__main__":
