@@ -14,12 +14,15 @@ from tkinter import ttk
 import pystray
 from PIL import Image, ImageDraw, ImageFont
 
-from jk_bms import ALARM_BITS, NOTICE_ALARMS, JkBms, find_all_bms, find_bms
+from alarm_history import ALARM, LINK, THRESHOLD, AlarmHistory, HistoryWindow
+from jk_bms import ALARM_BITS, NOTICE_ALARMS, SETTINGS_STREAM_SECONDS, JkBms, find_all_bms, find_bms
 
 CONFIG_PATH = Path(__file__).with_name("jk_config.json")
 POLL_SECONDS = 5
 # Without a streamed frame for this long, the monitor sends an explicit cell-info request; also the reconnect delay.
 REQUEST_SECONDS = 120
+# The BMS is not polled while the Scan dialog is open, so an unanswered dialog closes itself to resume alarms.
+SCAN_CHOICE_SECONDS = 120
 
 GREEN, YELLOW, RED = 0, 1, 2
 # Darker than the JBD monitor's palette so the two windows are easy to tell apart.
@@ -62,6 +65,45 @@ def level(key: str, value: float) -> int:
     return GREEN
 
 
+def value_levels(c) -> dict:
+    # JK reports charge current as positive, discharge as negative.
+    if c.current >= 0:
+        current_level = level("charge_a", c.current)
+    else:
+        current_level = level("discharge_a", -c.current)
+    serious = [a for a in c.alarms if a not in NOTICE_ALARMS]
+    return {
+        "SOC": level("soc", c.soc),
+        "Voltage": level("pack_v", c.voltage),
+        "Current": current_level,
+        "Power": current_level,
+        "Capacity": level("soc", c.soc),
+        "Temperature": max((level("temp_c", t) for t in c.temps_c), default=GREEN),
+        "MOS temp": level("temp_c", c.mos_temp_c),
+        "Cells": max((level("cell_v", x) for x in c.cells), default=GREEN),
+        "Cell delta": level("cell_delta_mv", (max(c.cells) - min(c.cells)) * 1000) if c.cells else GREEN,
+        "Switches": GREEN if c.charge_on and c.discharge_on else YELLOW,
+        "Alarms": RED if serious else YELLOW if c.alarms else GREEN,
+    }
+
+
+def frame_conditions(c) -> dict:
+    """Return {name: (kind, detail)} for every alarm bit and every value past its red limit in frame c."""
+    texts = {
+        "SOC": f"{c.soc}%",
+        "Voltage": f"{c.voltage:.2f} V",
+        "Current": f"{c.current:+.2f} A",
+        "Temperature": "  ".join(f"{t:.1f} °C" for t in c.temps_c),
+        "MOS temp": f"{c.mos_temp_c:.1f} °C",
+        "Cells": f"{min(c.cells):.3f} .. {max(c.cells):.3f} V" if c.cells else "",
+        "Cell delta": f"{(max(c.cells) - min(c.cells)) * 1000:.0f} mV" if c.cells else "",
+    }
+    levels = value_levels(c)
+    found = {name: (THRESHOLD, text) for name, text in texts.items() if levels[name] == RED}
+    found.update({f"Alarm: {a}": (ALARM, "notice" if a in NOTICE_ALARMS else "") for a in c.alarms})
+    return found
+
+
 def load_config() -> dict:
     try:
         return json.loads(CONFIG_PATH.read_text())
@@ -86,9 +128,13 @@ class BmsWorker:
         self.scanning = False
         self.choice = None
         self.wake = asyncio.Event()
+        self.task = None
         threading.Thread(target=self.loop.run_forever, daemon=True).start()
-        asyncio.run_coroutine_threadsafe(self._run(), self.loop).add_done_callback(
-            lambda f: self.post("status", f"Worker stopped: {f.exception()!r}; restart the monitor"))
+        asyncio.run_coroutine_threadsafe(self._run(), self.loop).add_done_callback(self._on_stopped)
+
+    def _on_stopped(self, f):
+        if not f.cancelled() and f.exception() is not None:
+            self.post("status", f"Worker stopped: {f.exception()!r}; restart the monitor")
 
     async def _disconnect(self):
         if self.bms:
@@ -109,7 +155,7 @@ class BmsWorker:
                 cfg["address"] = address
                 save_config(cfg)
             self.post("status", f"Connecting to {cfg['address']}...")
-            self.bms = JkBms(cfg["address"])
+            self.bms = JkBms(cfg["address"], on_cell_info=lambda c: self.post("frame", (time.time(), c)))
             await self.bms.connect()
             self.post("device", self.bms.device_info)
             self.post("settings", self.bms.latest_settings()[1])
@@ -118,14 +164,14 @@ class BmsWorker:
         if force:
             self.post("settings", await self.bms.read_settings())
             self.post("device", self.bms.device_info)
-            # The settings frame may still be streaming; a command sent meanwhile is ignored.
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(SETTINGS_STREAM_SECONDS)
         age = self.bms.cell_info_age()
         # Frames 5 s .. 2 min old were already shown; skip them so "Updated" tells the data age.
         if force or age <= POLL_SECONDS or age > REQUEST_SECONDS:
             self.post("data", await self.bms.read_cell_info(max_age=0 if force else REQUEST_SECONDS))
 
     async def _run(self):
+        self.task = asyncio.current_task()
         cfg = load_config()
         while True:
             delay = None
@@ -194,9 +240,12 @@ class BmsWorker:
         self.loop.call_soon_threadsafe(apply)
 
     def close(self):
-        """Release the BLE connection before exit; paused keeps the loop from reconnecting."""
+        """Stop the poll loop, including a connect in progress, then release the BLE connection before exit."""
         async def job():
             self.paused = True
+            if self.task:
+                self.task.cancel()
+                await asyncio.gather(self.task, return_exceptions=True)
             await self._disconnect()
         return asyncio.run_coroutine_threadsafe(job(), self.loop)
 
@@ -227,6 +276,8 @@ class App:
     def __init__(self):
         self.events = queue.Queue()
         self.alerted = set()
+        self.history = AlarmHistory()
+        self.history_win = None
         self.tray_soc = None
         self.worker = None
         self.closing = False
@@ -313,6 +364,8 @@ class App:
         self.connect_btn.pack(side="left", padx=(8, 0))
         self.scan_btn = ttk.Button(conn, text="Scan", command=self._scan)
         self.scan_btn.pack(side="left", padx=8)
+        self.history_btn = ttk.Button(conn, text="History", command=self._show_history)
+        self.history_btn.pack(side="left", padx=(0, 8))
         self.updated_var = tk.StringVar(value="Updated: --")
         ttk.Label(conn, textvariable=self.updated_var, foreground="gray").pack(side="left")
 
@@ -346,14 +399,18 @@ class App:
         else:
             lb.insert("end", "No JK BMS found; disconnect the phone and rescan")
 
-        def finish(address):
+        def close_dialog():
+            dlg.after_cancel(timeout)
             dlg.destroy()
+
+        def finish(address):
+            close_dialog()
             self.scan_busy = False
             self.scan_btn.config(state="normal" if self.connect_btn.cget("text") == "Disconnect" else "disabled")
             self.worker.choose(address)
 
         def rescan():
-            dlg.destroy()
+            close_dialog()
             self.scan_busy = False
             self.worker.choose("")
             self._scan()
@@ -371,6 +428,7 @@ class App:
         ttk.Button(buttons, text="Cancel", command=lambda: finish("")).pack(side="right")
         lb.bind("<Double-Button-1>", lambda _e: connect())
         dlg.protocol("WM_DELETE_WINDOW", lambda: finish(""))
+        timeout = dlg.after(SCAN_CHOICE_SECONDS * 1000, lambda: finish(""))
 
     def _toggle_connection(self):
         paused = self.connect_btn.cget("text") == "Disconnect"
@@ -410,6 +468,8 @@ class App:
         d["Battery"].set(f"{s['nominal_ah']:.0f} Ah, {s['cell_count']} cells")
 
     def _show_data(self, c):
+        if self.status_var.get() == "Refreshing...":
+            self.status_var.set("Refreshed")
         self.soc_var.set(f"{c.soc}%")
         self.soc_bar["value"] = c.soc
         v = self.vars
@@ -451,25 +511,8 @@ class App:
         self.tray.title = f"JK {c.soc}%  {c.voltage:.2f} V  {c.current:+.2f} A"
 
     def _apply_levels(self, c):
-        # JK reports charge current as positive, discharge as negative.
-        if c.current >= 0:
-            current_level = level("charge_a", c.current)
-        else:
-            current_level = level("discharge_a", -c.current)
         serious = [a for a in c.alarms if a not in NOTICE_ALARMS]
-        levels = {
-            "SOC": level("soc", c.soc),
-            "Voltage": level("pack_v", c.voltage),
-            "Current": current_level,
-            "Power": current_level,
-            "Capacity": level("soc", c.soc),
-            "Temperature": max((level("temp_c", t) for t in c.temps_c), default=GREEN),
-            "MOS temp": level("temp_c", c.mos_temp_c),
-            "Cells": max((level("cell_v", x) for x in c.cells), default=GREEN),
-            "Cell delta": level("cell_delta_mv", (max(c.cells) - min(c.cells)) * 1000) if c.cells else GREEN,
-            "Switches": GREEN if c.charge_on and c.discharge_on else YELLOW,
-            "Alarms": RED if serious else YELLOW if c.alarms else GREEN,
-        }
+        levels = value_levels(c)
         self.soc_label.config(foreground=LEVEL_COLORS[levels["SOC"]])
         for name, lvl in levels.items():
             if name in self.value_labels:
@@ -491,6 +534,9 @@ class App:
             kind, payload = self.events.get()
             if kind == "data":
                 self._show_data(payload)
+            elif kind == "frame":
+                if self.history.observe(frame_conditions(payload[1]), payload[0]):
+                    self._history_changed()
             elif kind == "device":
                 self._show_device(payload)
             elif kind == "settings":
@@ -499,6 +545,7 @@ class App:
                 self._show_scan(*payload)
             elif kind == "status":
                 self.status_var.set(payload)
+                self._track_status(payload)
             elif kind == "show":
                 self.root.deiconify()
                 self.root.lift()
@@ -508,6 +555,34 @@ class App:
                 self.tray.stop()
                 self._finish_exit(self.worker.close() if self.worker else None, time.monotonic() + 5)
                 return
+
+    def _track_status(self, text: str):
+        now = time.time()
+        if text.startswith(("Error:", "Worker stopped")):
+            changed = self.history.link_down(text, now)
+        elif text.startswith("Connected to"):
+            changed = self.history.link_up(now)
+        elif text.startswith("Scan failed"):
+            changed = self.history.note(LINK, "Scan failed", text, now)
+        elif text.startswith(("Disconnected;", "Scanning")):
+            changed = self.history.cut(now)
+        else:
+            changed = False
+        if changed:
+            self._history_changed()
+
+    def _history_changed(self):
+        active = self.history.active_count()
+        self.history_btn.config(text=f"History ({len(self.history.entries)}"
+                                     + (f", {active} active)" if active else ")"))
+        if self.history_win and self.history_win.alive():
+            self.history_win.refresh()
+
+    def _show_history(self):
+        if self.history_win and self.history_win.alive():
+            self.history_win.show()
+        else:
+            self.history_win = HistoryWindow(self.root, self.history, "JK BMS: session history")
 
     def _finish_exit(self, fut, deadline):
         # Tk keeps running while the worker disconnects, so a worker post cannot block the disconnect.
