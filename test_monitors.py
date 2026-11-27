@@ -125,7 +125,12 @@ def jbd_basic(prot=0, charge_on=True, discharge_on=True, soc=85):
 
 
 def data_event(module, cells, soc=85):
-    return ("data", jk_cell(cells, soc=soc)) if module is jkm else ("data", (jbd_basic(soc=soc), list(cells)))
+    if module is jkm:
+        return "frame", (time.time(), jk_cell(cells, soc=soc))
+    return "data", (jbd_basic(soc=soc), list(cells))
+
+
+DATA_KIND = {jkm: "frame", jbm: "data"}
 
 
 def cell_frame():
@@ -150,7 +155,7 @@ class FakeBms:
 
     def __init__(self, address, on_cell_info=None):
         self.address, self.connected, self.device_info, self.mos = address, False, dict(DEVICE), []
-        self.basic = jbd_basic()
+        self.basic, self.on_cell_info = jbd_basic(), on_cell_info
         self.hold, self.held = False, []
 
     async def connect(self):
@@ -168,9 +173,10 @@ class FakeBms:
         return None, None
 
     def cell_info_age(self):
-        return 0.0
+        return float("inf")
 
     async def read_cell_info(self, max_age=5.0):
+        self.on_cell_info(jk_cell())
         return jk_cell()
 
     async def read_basic(self):
@@ -366,7 +372,7 @@ class MonitorTest(unittest.TestCase):
         for module in (jkm, jbm):
             with self.subTest(module.__name__):
                 worker, rec = self.start_worker(module, POLL_SECONDS=0.2)
-                self.assertTrue(rec.wait_for("data"))
+                self.assertTrue(rec.wait_for(DATA_KIND[module]))
                 mark = len(rec.items)
                 worker.bms.connected = False
                 self.assertTrue(rec.wait_for("status", "Connected to", mark))
@@ -415,11 +421,35 @@ class MonitorTest(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         worker, rec = self.start_worker(jkm, JkBms=SilentOn97, SETTINGS_STREAM_SECONDS=0.05)
-        self.assertTrue(rec.wait_for("data"))
+        self.assertTrue(rec.wait_for("frame"))
         mark = len(rec.items)
         worker.refresh()
-        self.assertTrue(rec.wait_for("data", start=mark))
+        self.assertTrue(rec.wait_for("frame", start=mark))
         self.assertEqual(rec.statuses(mark), ["Settings not refreshed: no reply to command 0x97"])
+
+    def test_jk_shows_every_streamed_frame(self):
+        worker, rec = self.start_worker(jkm, JkBms=SilentOn97, SETTINGS_STREAM_SECONDS=0.05)
+        self.assertTrue(rec.wait_for("frame"))
+        mark = len(rec.items)
+        for _ in range(3):
+            worker.loop.call_soon_threadsafe(worker.bms._on_notify, None, bytearray(cell_frame()))
+        self.assertTrue(wait_until(lambda: [k for k, _p in rec.items[mark:]] == ["frame"] * 3))
+        self.assertNotIn("data", [k for k, _p in rec.items])
+        app = fake_app(jkm)
+        for soc in (40, 41):
+            app.events.put(("frame", (time.time(), jk_cell(soc=soc))))
+            app._pump()
+            self.assertEqual(app.soc_var.get(), f"{soc}%")
+
+    def test_jbd_polls_every_second_while_the_window_is_shown(self):
+        worker, rec = self.start_worker(jbm)
+        self.assertTrue(rec.wait_for("data"))
+        worker.set_window_shown(True)
+        for _ in range(2):
+            mark = len(rec.items)
+            self.assertTrue(rec.wait_for("data", start=mark, timeout=2.0))
+        worker.set_window_shown(False)
+        self.assertTrue(wait_until(lambda: worker.poll_seconds == jbm.POLL_SECONDS))
 
     def test_config_problems_do_not_stop_the_monitor(self):
         tmp = tempfile.TemporaryDirectory()
@@ -436,7 +466,7 @@ class MonitorTest(unittest.TestCase):
                 path.write_text("[]")
                 _worker, rec = self.start_worker(module, CONFIG_PATH=path, load_config=module.load_config,
                                                  save_config=deny)
-                self.assertTrue(rec.wait_for("data"))
+                self.assertTrue(rec.wait_for(DATA_KIND[module]))
                 statuses = rec.statuses()
                 self.assertTrue(statuses[0].startswith(f"Could not read {path.name}"))
                 self.assertTrue(any(s.startswith(f"Could not save {path.name}") for s in statuses))
@@ -454,7 +484,7 @@ class MonitorTest(unittest.TestCase):
         for module in (jkm, jbm):
             with self.subTest(module.__name__):
                 worker, rec = self.start_worker(module)
-                self.assertTrue(rec.wait_for("data"))
+                self.assertTrue(rec.wait_for(DATA_KIND[module]))
                 worker.refresh()
                 worker.close().result(2)
 

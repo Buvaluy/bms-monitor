@@ -16,6 +16,7 @@ from monitor_common import MonitorApp, MonitorWorker, read_config, run_app, writ
 CONFIG_PATH = Path(__file__).with_name("bms_config.json")
 # The link stays open between polls, so a short interval costs two small reads, not a reconnect.
 POLL_SECONDS = 15
+SHOWN_POLL_SECONDS = 1
 RETRY_SECONDS = 120
 
 PROTECTION_BITS = [
@@ -135,6 +136,13 @@ class BmsWorker(MonitorWorker):
     def refresh(self):
         self.loop.call_soon_threadsafe(self.wake.set)
 
+    def set_window_shown(self, shown: bool):
+        def apply():
+            if shown and self.poll_seconds == POLL_SECONDS:
+                self.wake.set()  # fresh numbers right away, not after the rest of the slow wait
+            self.poll_seconds = SHOWN_POLL_SECONDS if shown else POLL_SECONDS
+        self.loop.call_soon_threadsafe(apply)
+
     def set_switch(self, bit: int, on: bool):
         """Turn one MOSFET (bit 0x01 charge, 0x02 output) on or off; the other keeps the state in mos_off."""
         async def job():
@@ -213,6 +221,15 @@ class App(MonitorApp):
     def __init__(self):
         self.last_basic = None
         super().__init__()
+        # Hiding to the tray and minimizing both unmap the window; child widgets fire these events too.
+        self.root.bind("<Map>", lambda e: e.widget is self.root and self._window_shown(True))
+        self.root.bind("<Unmap>", lambda e: e.widget is self.root and self._window_shown(False))
+
+    def _window_shown(self, shown: bool):
+        if self.worker:
+            self.worker.set_window_shown(shown)
+        else:
+            self.root.after(100, self._window_shown, shown)
 
     def _build_ui(self):
         pad = {"padx": 8, "pady": 2}

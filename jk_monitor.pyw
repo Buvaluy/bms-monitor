@@ -137,10 +137,9 @@ class BmsWorker(MonitorWorker):
             except TimeoutError as e:
                 self.post("status", f"Settings not refreshed: {e}")
             await asyncio.sleep(SETTINGS_STREAM_SECONDS)
-        age = self.bms.cell_info_age()
-        # Frames 5 s .. 2 min old were already shown; skip them so "Updated" tells the data age.
-        if force or age <= POLL_SECONDS or age > REQUEST_SECONDS:
-            self.post("data", await self.bms.read_cell_info(max_age=0 if force else REQUEST_SECONDS))
+        # The reply arrives as a "frame" like any streamed cell-info frame, so it is not posted here.
+        if force or self.bms.cell_info_age() > REQUEST_SECONDS:
+            await self.bms.read_cell_info(max_age=0)
 
     async def _find_all(self) -> list:
         return await find_all_bms()
@@ -372,11 +371,10 @@ class App(MonitorApp):
                          f"{n}: {self.soc_var.get() if n == 'SOC' else self.vars[n].get()}" for n in sorted(names))
 
     def _handle_event(self, kind: str, payload):
-        if kind == "data":
-            self._show_data(payload)
-        elif kind == "frame":
+        if kind == "frame":
             if self.history.observe(frame_conditions(payload[1]), payload[0]):
                 self._history_changed()
+            self._show_data(payload[1])
         elif kind == "device":
             self._show_device(payload)
         elif kind == "settings":

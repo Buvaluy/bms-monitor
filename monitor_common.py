@@ -54,7 +54,9 @@ def run_app(app_class, mutex_name: str):
     """Start app_class unless another instance holds mutex_name; --tray starts with the window hidden."""
     title = app_class.window_title
     if another_instance_running(mutex_name):
-        ctypes.windll.user32.MessageBoxW(None, f"{title} is already running; open it from the tray.", title, 0x40)
+        ctypes.windll.user32.MessageBoxW(None, f"{title} is already running; open it from the tray.\n\n"
+                                         "If you did not start it twice, check autostart for a duplicate entry.",
+                                         title, 0x40)
         sys.exit(1)
     app = app_class()
     if "--tray" in sys.argv:
